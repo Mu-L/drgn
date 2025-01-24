@@ -5,7 +5,6 @@
 #include <math.h>
 
 #include "drgnpy.h"
-#include "../cleanup.h"
 #include "../error.h"
 #include "../object.h"
 #include "../serialize.h"
@@ -429,7 +428,7 @@ static DrgnObject *DrgnObject_new(PyTypeObject *subtype, PyObject *args,
 			return NULL;
 		} else if (ret) {
 			PyErr_Format(PyExc_TypeError,
-				     "cannot create %s literal",
+				     "literal must be int, float, or bool, not '%s'",
 				     Py_TYPE(value_obj)->tp_name);
 			return NULL;
 		}
@@ -447,7 +446,7 @@ static DrgnObject *DrgnObject_new(PyTypeObject *subtype, PyObject *args,
 		if (err)
 			return set_drgn_error(err);
 
-		SWITCH_ENUM(object_type.encoding,
+		SWITCH_ENUM(object_type.encoding) {
 		case DRGN_OBJECT_ENCODING_BUFFER:
 			if (buffer_object_from_value(&obj->obj, &object_type,
 						     value_obj) == -1)
@@ -518,7 +517,9 @@ static DrgnObject *DrgnObject_new(PyTypeObject *subtype, PyObject *args,
 			err = drgn_error_incomplete_type("cannot create value with %s type",
 							 qualified_type.type);
 			break;
-		)
+		default:
+			UNREACHABLE();
+		}
 	} else {
 		if (!qualified_type.type) {
 			PyErr_SetString(PyExc_ValueError,
@@ -734,7 +735,7 @@ static DrgnObject *DrgnObject_address_of(DrgnObject *self)
 static DrgnObject *DrgnObject_read(DrgnObject *self)
 {
 	struct drgn_error *err;
-	SWITCH_ENUM(self->obj.kind,
+	SWITCH_ENUM(self->obj.kind) {
 	case DRGN_OBJECT_VALUE:
 		Py_INCREF(self);
 		return self;
@@ -750,7 +751,9 @@ static DrgnObject *DrgnObject_read(DrgnObject *self)
 	}
 	case DRGN_OBJECT_ABSENT:
 		return set_drgn_error(&drgn_error_object_absent);
-	)
+	default:
+		UNREACHABLE();
+	}
 }
 
 static PyObject *DrgnObject_to_bytes(DrgnObject *self)
@@ -778,7 +781,7 @@ static DrgnObject *DrgnObject_from_bytes(PyTypeObject *type, PyObject *args,
 	Py_buffer bytes;
 	struct index_arg bit_offset = {};
 	struct index_arg bit_field_size = { .allow_none = true, .is_none = true };
-	if (!PyArg_ParseTupleAndKeywords(args, kwds, "O!Oy*|O&O&:from_bytes_",
+	if (!PyArg_ParseTupleAndKeywords(args, kwds, "O!Oy*|$O&O&:from_bytes_",
 					 keywords, &Program_type, &prog,
 					 &type_obj, &bytes, index_converter,
 					 &bit_offset, index_converter,
@@ -841,7 +844,7 @@ static PyObject *DrgnObject_repr(DrgnObject *self)
 	if (append_format(parts, "Object(prog, %R", tmp) == -1)
 		return NULL;
 
-	SWITCH_ENUM(self->obj.kind,
+	SWITCH_ENUM(self->obj.kind) {
 	case DRGN_OBJECT_VALUE: {
 		if (append_string(parts, ", value=") == -1)
 			return NULL;
@@ -870,7 +873,9 @@ static PyObject *DrgnObject_repr(DrgnObject *self)
 	}
 	case DRGN_OBJECT_ABSENT:
 		break;
-	)
+	default:
+		UNREACHABLE();
+	}
 
 	if (self->obj.is_bit_field &&
 	    append_format(parts, ", bit_field_size=%llu",
@@ -1006,13 +1011,15 @@ static PyObject *DrgnObject_get_address(DrgnObject *self, void *arg)
 
 static PyObject *DrgnObject_get_bit_offset(DrgnObject *self, void *arg)
 {
-	SWITCH_ENUM(self->obj.kind,
+	SWITCH_ENUM(self->obj.kind) {
 	case DRGN_OBJECT_REFERENCE:
 		return PyLong_FromUint8(self->obj.bit_offset);
 	case DRGN_OBJECT_VALUE:
 	case DRGN_OBJECT_ABSENT:
 		Py_RETURN_NONE;
-	)
+	default:
+		UNREACHABLE();
+	}
 }
 
 static PyObject *DrgnObject_get_bit_field_size(DrgnObject *self, void *arg)
@@ -1129,7 +1136,7 @@ static int DrgnObject_bool(DrgnObject *self)
 static PyObject *DrgnObject_int(DrgnObject *self)
 {
 	struct drgn_error *err;
-	SWITCH_ENUM(self->obj.encoding,
+	SWITCH_ENUM(self->obj.encoding) {
 	case DRGN_OBJECT_ENCODING_SIGNED:
 	case DRGN_OBJECT_ENCODING_UNSIGNED:
 	case DRGN_OBJECT_ENCODING_SIGNED_BIG:
@@ -1148,13 +1155,15 @@ static PyObject *DrgnObject_int(DrgnObject *self)
 	case DRGN_OBJECT_ENCODING_INCOMPLETE_INTEGER:
 		return set_error_type_name("cannot convert '%s' to int",
 					   drgn_object_qualified_type(&self->obj));
-	)
+	default:
+		UNREACHABLE();
+	}
 }
 
 static PyObject *DrgnObject_float(DrgnObject *self)
 {
 	struct drgn_error *err;
-	SWITCH_ENUM(self->obj.encoding,
+	SWITCH_ENUM(self->obj.encoding) {
 	case DRGN_OBJECT_ENCODING_FLOAT: {
 		double fvalue;
 		err = drgn_object_read_float(&self->obj, &fvalue);
@@ -1183,12 +1192,14 @@ static PyObject *DrgnObject_float(DrgnObject *self)
 	case DRGN_OBJECT_ENCODING_INCOMPLETE_INTEGER:
 		return set_error_type_name("cannot convert '%s' to float",
 					   drgn_object_qualified_type(&self->obj));
-	)
+	default:
+		UNREACHABLE();
+	}
 }
 
 static PyObject *DrgnObject_index(DrgnObject *self)
 {
-	SWITCH_ENUM(self->obj.encoding,
+	SWITCH_ENUM(self->obj.encoding) {
 	case DRGN_OBJECT_ENCODING_SIGNED:
 	case DRGN_OBJECT_ENCODING_UNSIGNED:
 	case DRGN_OBJECT_ENCODING_SIGNED_BIG:
@@ -1201,7 +1212,9 @@ static PyObject *DrgnObject_index(DrgnObject *self)
 	case DRGN_OBJECT_ENCODING_INCOMPLETE_INTEGER:
 		return set_error_type_name("'%s' object cannot be interpreted as an integer",
 					   drgn_object_qualified_type(&self->obj));
-	)
+	default:
+		UNREACHABLE();
+	}
 }
 
 static PyObject *DrgnObject_round(DrgnObject *self, PyObject *args,
@@ -1618,58 +1631,38 @@ PyObject *DrgnObject_NULL(PyObject *self, PyObject *args, PyObject *kwds)
 				     prog_obj, type_obj, 0);
 }
 
-DrgnObject *cast(PyObject *self, PyObject *args, PyObject *kwds)
-{
-	static char *keywords[] = {"type", "obj", NULL};
-	struct drgn_error *err;
-	struct drgn_qualified_type qualified_type;
-	PyObject *type_obj;
-	DrgnObject *obj;
-	if (!PyArg_ParseTupleAndKeywords(args, kwds, "OO!:cast", keywords,
-					 &type_obj, &DrgnObject_type, &obj))
-		return NULL;
-
-	if (Program_type_arg(DrgnObject_prog(obj), type_obj, false,
-			     &qualified_type) == -1)
-		return NULL;
-
-	_cleanup_pydecref_ DrgnObject *res =
-		DrgnObject_alloc(DrgnObject_prog(obj));
-	if (!res)
-		return NULL;
-
-	err = drgn_object_cast(&res->obj, qualified_type, &obj->obj);
-	if (err)
-		return set_drgn_error(err);
-	return_ptr(res);
+#define DrgnObject_CAST_OP(op)							\
+DrgnObject *op(PyObject *self, PyObject *args, PyObject *kwds)			\
+{										\
+	static char *keywords[] = {"type", "obj", NULL};			\
+	struct drgn_error *err;							\
+	PyObject *type_obj;							\
+	DrgnObject *obj;							\
+	if (!PyArg_ParseTupleAndKeywords(args, kwds, "OO!:" #op, keywords,	\
+					 &type_obj, &DrgnObject_type, &obj))	\
+		return NULL;							\
+										\
+	struct drgn_qualified_type qualified_type;				\
+	if (Program_type_arg(DrgnObject_prog(obj), type_obj, false,		\
+			     &qualified_type) == -1)				\
+		return NULL;							\
+										\
+	_cleanup_pydecref_ DrgnObject *res =					\
+		DrgnObject_alloc(DrgnObject_prog(obj));				\
+	if (!res)								\
+		return NULL;							\
+										\
+	err = drgn_object_##op(&res->obj, qualified_type, &obj->obj);		\
+	if (err)								\
+		return set_drgn_error(err);					\
+	return_ptr(res);							\
 }
 
-DrgnObject *reinterpret(PyObject *self, PyObject *args, PyObject *kwds)
-{
-	static char *keywords[] = {"type", "obj", NULL};
-	struct drgn_error *err;
-	PyObject *type_obj;
-	struct drgn_qualified_type qualified_type;
-	DrgnObject *obj;
-	if (!PyArg_ParseTupleAndKeywords(args, kwds, "OO!:reinterpret",
-					 keywords, &type_obj, &DrgnObject_type,
-					 &obj))
-		return NULL;
+DrgnObject_CAST_OP(cast)
+DrgnObject_CAST_OP(implicit_convert)
+DrgnObject_CAST_OP(reinterpret)
 
-	if (Program_type_arg(DrgnObject_prog(obj), type_obj, false,
-			     &qualified_type) == -1)
-		return NULL;
-
-	_cleanup_pydecref_ DrgnObject *res =
-		DrgnObject_alloc(DrgnObject_prog(obj));
-	if (!res)
-		return NULL;
-
-	err = drgn_object_reinterpret(&res->obj, qualified_type, &obj->obj);
-	if (err)
-		return set_drgn_error(err);
-	return_ptr(res);
-}
+#undef DrgnObject_CAST_OP
 
 DrgnObject *DrgnObject_container_of(PyObject *self, PyObject *args,
 				    PyObject *kwds)

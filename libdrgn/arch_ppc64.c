@@ -4,10 +4,11 @@
 #include <byteswap.h>
 #include <elf.h>
 #include <endian.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "cleanup.h"
-#include "drgn.h"
+#include "drgn_internal.h"
 #include "error.h"
 #include "platform.h" // IWYU pragma: associated
 #include "program.h"
@@ -351,7 +352,7 @@ linux_kernel_pgtable_iterator_create_ppc64(struct drgn_program * prog,
 	err = drgn_program_find_object(prog, "interrupt_base_book3e", NULL,
 				       DRGN_FIND_OBJECT_ANY, &tmp);
 	if (!err) {
-		return drgn_error_create(DRGN_ERROR_OTHER,
+		return drgn_error_create(DRGN_ERROR_NOT_IMPLEMENTED,
 					 "virtual address translation is not available for BOOK3E CPU family");
 	}
 	if (err->code != DRGN_ERROR_LOOKUP)
@@ -372,7 +373,7 @@ linux_kernel_pgtable_iterator_create_ppc64(struct drgn_program * prog,
 	if (err)
 		return err;
 	if (!(mmu_features & 0x40)) {
-		return drgn_error_create(DRGN_ERROR_OTHER,
+		return drgn_error_create(DRGN_ERROR_NOT_IMPLEMENTED,
 					 "virtual address translation is only supported for Radix MMU");
 	}
 
@@ -455,6 +456,7 @@ const struct drgn_architecture_info arch_info_ppc64 = {
 	.arch = DRGN_ARCH_PPC64,
 	.default_flags = (DRGN_PLATFORM_IS_64_BIT |
 			  DRGN_PLATFORM_IS_LITTLE_ENDIAN),
+	.scalar_alignment = { 1, 2, 4, 8, 16 },
 	DRGN_ARCHITECTURE_REGISTERS,
 	.default_dwarf_cfi_row = &default_dwarf_cfi_row_ppc64,
 	.fallback_unwind = fallback_unwind_ppc64,

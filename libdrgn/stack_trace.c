@@ -2,19 +2,19 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
 #include <assert.h>
+#include <elf.h>
 #include <elfutils/libdw.h>
-#include <elfutils/libdwfl.h>
 #include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "cfi.h"
-#include "cleanup.h"
 #include "debug_info.h"
-#include "drgn.h"
+#include "drgn_internal.h"
 #include "dwarf_constants.h"
 #include "dwarf_info.h"
 #include "elf_file.h"
+#include "elf_notes.h"
 #include "error.h"
 #include "helpers.h"
 #include "minmax.h"
@@ -109,6 +109,7 @@ drgn_stack_trace_num_frames(struct drgn_stack_trace *trace)
 LIBDRGN_PUBLIC struct drgn_error *
 drgn_format_stack_trace(struct drgn_stack_trace *trace, char **ret)
 {
+	struct drgn_error *err;
 	STRING_BUILDER(str);
 	for (size_t frame = 0; frame < trace->num_frames; frame++) {
 		if (!string_builder_appendf(&str, "#%-2zu ", frame))
@@ -116,24 +117,25 @@ drgn_format_stack_trace(struct drgn_stack_trace *trace, char **ret)
 
 		struct drgn_register_state *regs = trace->frames[frame].regs;
 		struct optional_uint64 pc;
-		const char *name = drgn_stack_frame_name(trace, frame);
-		if (name) {
-			if (!string_builder_append(&str, name))
+		const char *function_name =
+			drgn_stack_frame_function_name(trace, frame);
+		if (function_name) {
+			if (!string_builder_append(&str, function_name))
 				return &drgn_enomem;
 		} else if ((pc = drgn_register_state_get_pc(regs)).has_value) {
-			Dwfl_Module *dwfl_module =
-				regs->module ? regs->module->dwfl_module : NULL;
-			struct drgn_symbol sym;
-			if (dwfl_module &&
-			    drgn_program_find_symbol_by_address_internal(trace->prog,
-									 pc.value - !regs->interrupted,
-									 dwfl_module,
-									 &sym)) {
+			_cleanup_symbol_ struct drgn_symbol *sym = NULL;
+			err = drgn_program_find_symbol_by_address_internal(trace->prog,
+									   pc.value - !regs->interrupted,
+									   &sym);
+			if (err)
+				return err;
+
+			if (sym) {
 				if (!string_builder_appendf(&str,
 							    "%s+0x%" PRIx64 "/0x%" PRIx64,
-							    sym.name,
-							    pc.value - sym.address,
-							    sym.size))
+							    sym->name,
+							    pc.value - sym->address,
+							    sym->size))
 					return &drgn_enomem;
 			} else {
 				if (!string_builder_appendf(&str, "0x%" PRIx64,
@@ -173,6 +175,7 @@ drgn_format_stack_frame(struct drgn_stack_trace *trace, size_t frame, char **ret
 {
 	STRING_BUILDER(str);
 	struct drgn_register_state *regs = trace->frames[frame].regs;
+	struct drgn_error *err;
 	if (!string_builder_appendf(&str, "#%zu at ", frame))
 		return &drgn_enomem;
 
@@ -181,25 +184,24 @@ drgn_format_stack_frame(struct drgn_stack_trace *trace, size_t frame, char **ret
 		if (!string_builder_appendf(&str, "%#" PRIx64, pc.value))
 			return &drgn_enomem;
 
-		Dwfl_Module *dwfl_module =
-			regs->module ? regs->module->dwfl_module : NULL;
-		struct drgn_symbol sym;
-		if (dwfl_module &&
-		    drgn_program_find_symbol_by_address_internal(trace->prog,
-								 pc.value - !regs->interrupted,
-								 dwfl_module,
-								 &sym) &&
-		    !string_builder_appendf(&str, " (%s+0x%" PRIx64 "/0x%" PRIx64 ")",
-					    sym.name, pc.value - sym.address,
-					    sym.size))
+		_cleanup_symbol_ struct drgn_symbol *sym;
+		err = drgn_program_find_symbol_by_address_internal(trace->prog,
+								   pc.value - !regs->interrupted,
+								   &sym);
+		if (err)
+			return err;
+		if (sym && !string_builder_appendf(&str, " (%s+0x%" PRIx64 "/0x%" PRIx64 ")",
+						   sym->name, pc.value - sym->address,
+						   sym->size))
 			return &drgn_enomem;
 	} else {
 		if (!string_builder_append(&str, "???"))
 			return &drgn_enomem;
 	}
 
-	const char *name = drgn_stack_frame_name(trace, frame);
-	if (name && !string_builder_appendf(&str, " in %s", name))
+	const char *function_name = drgn_stack_frame_function_name(trace, frame);
+	if (function_name
+	    && !string_builder_appendf(&str, " in %s", function_name))
 		return &drgn_enomem;
 
 	int line, column;
@@ -224,8 +226,42 @@ drgn_format_stack_frame(struct drgn_stack_trace *trace, size_t frame, char **ret
 	return NULL;
 }
 
-LIBDRGN_PUBLIC const char *drgn_stack_frame_name(struct drgn_stack_trace *trace,
-						 size_t frame)
+LIBDRGN_PUBLIC
+struct drgn_error *drgn_stack_frame_name(struct drgn_stack_trace *trace,
+					 size_t frame, char **ret)
+{
+	struct drgn_error *err;
+	char *name;
+	const char *function_name = drgn_stack_frame_function_name(trace, frame);
+	if (function_name) {
+		name = strdup(function_name);
+	} else {
+		struct drgn_register_state *regs = trace->frames[frame].regs;
+		struct optional_uint64 pc = drgn_register_state_get_pc(regs);
+		if (pc.has_value) {
+			_cleanup_symbol_ struct drgn_symbol *sym = NULL;
+			err = drgn_program_find_symbol_by_address_internal(trace->prog,
+									   pc.value - !regs->interrupted,
+									   &sym);
+			if (err)
+				return err;
+			if (sym)
+				name = strdup(sym->name);
+			else if (asprintf(&name, "0x%" PRIx64, pc.value) < 0)
+				name = NULL;
+		} else {
+			name = strdup("???");
+		}
+	}
+	if (!name)
+		return &drgn_enomem;
+	*ret = name;
+	return NULL;
+}
+
+LIBDRGN_PUBLIC
+const char *drgn_stack_frame_function_name(struct drgn_stack_trace *trace,
+					   size_t frame)
 {
 	Dwarf_Die *scopes = trace->frames[frame].scopes;
 	size_t num_scopes = trace->frames[frame].num_scopes;
@@ -368,17 +404,15 @@ drgn_stack_frame_symbol(struct drgn_stack_trace *trace, size_t frame,
 					 "program counter is not known at stack frame");
 	}
 	pc.value -= !regs->interrupted;
-	Dwfl_Module *dwfl_module =
-		regs->module ? regs->module->dwfl_module : NULL;
-	if (!dwfl_module)
-		return drgn_error_symbol_not_found(pc.value);
-	_cleanup_free_ struct drgn_symbol *sym = malloc(sizeof(*sym));
+	struct drgn_symbol *sym = NULL;
+	struct drgn_error *err;
+	err = drgn_program_find_symbol_by_address_internal(trace->prog, pc.value,
+							   &sym);
+	if (err)
+		return err;
 	if (!sym)
-		return &drgn_enomem;
-	if (!drgn_program_find_symbol_by_address_internal(trace->prog, pc.value,
-							  dwfl_module, sym))
 		return drgn_error_symbol_not_found(pc.value);
-	*ret = no_cleanup_ptr(sym);
+	*ret = sym;
 	return NULL;
 }
 
@@ -465,11 +499,12 @@ drgn_stack_frame_find_object(struct drgn_stack_trace *trace, size_t frame_i,
 	}
 	if (!die.addr) {
 not_found:;
-		const char *frame_name = drgn_stack_frame_name(trace, frame_i);
-		if (frame_name) {
+		const char *function_name =
+			drgn_stack_frame_function_name(trace, frame_i);
+		if (function_name) {
 			return drgn_error_format(DRGN_ERROR_LOOKUP,
 						 "could not find '%s' in '%s'",
-						 name, frame_name);
+						 name, function_name);
 		} else {
 			return drgn_error_format(DRGN_ERROR_LOOKUP,
 						 "could not find '%s'", name);
@@ -488,11 +523,23 @@ not_found:;
 	// different platform than the program.
 	if (!drgn_platforms_equal(&file->platform, &trace->prog->platform))
 		regs = NULL;
-	Dwarf_Die function_die = frame->scopes[frame->function_scope];
+	// If this is an inline frame, then DW_AT_frame_base is in the
+	// containing DW_TAG_subprogram DIE.
+	size_t subprogram_frame_i = frame_i;
+	Dwarf_Die *function_die;
+	for (;;) {
+		struct drgn_stack_frame *subprogram_frame =
+			&trace->frames[subprogram_frame_i];
+		function_die =
+			&subprogram_frame->scopes[subprogram_frame->function_scope];
+		if (dwarf_tag(function_die) == DW_TAG_subprogram)
+			break;
+		subprogram_frame_i++;
+	}
 	return drgn_object_from_dwarf(&trace->prog->dbinfo, file, &die,
 				      dwarf_tag(&die) == DW_TAG_enumerator ?
 				      &type_die : NULL,
-				      &function_die, regs, ret);
+				      function_die, regs, ret);
 }
 
 LIBDRGN_PUBLIC bool drgn_stack_frame_register(struct drgn_stack_trace *trace,
@@ -576,6 +623,110 @@ drgn_get_initial_registers_from_prstatus(struct drgn_program *prog,
 }
 
 static struct drgn_error *
+drgn_get_initial_registers_from_kernel_core_dump(struct drgn_program *prog,
+						 uint64_t cpu,
+						 struct drgn_register_state **ret)
+{
+	struct drgn_error *err;
+	// For kernel core dumps, we can't look up PRSTATUS notes by PID for
+	// multiple reasons:
+	//
+	// 1. Each CPU has its own idle task, all with PID 0.
+	// 2. Kdump on s390x populates the PID field of the PRSTATUS notes with
+	//    the CPU number + 1.
+	// 3. QEMU's dump-guest-memory command does the same.
+	//
+	// Instead, we have to look it up by CPU number. The way to do this
+	// depends on whether the core dump was generated by a real crash (e.g.,
+	// by kdump) or while the kernel was running (e.g., by a hypervisor) as
+	// well as the architecture.
+	//
+	// Note that all of this is inherently racy: cpu_curr() [1], current
+	// [2], registers [3], and the stack pointer [4] are all updated at
+	// different times. This might result in confusing stack traces during a
+	// context switch, but there's not much we can do about that.
+	//
+	// 1: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/kernel/sched/core.c?h=v6.6#n6672
+	// 2: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/arch/x86/kernel/process_64.c?h=v6.6#n623
+	// 3: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/arch/x86/entry/entry_64.S?h=v6.6#n267
+	// 4: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/arch/x86/entry/entry_64.S?h=v6.6#n249
+	if (prog->vmcoreinfo.have_crashtime
+	    && prog->platform.arch->arch != DRGN_ARCH_S390X) {
+		// If the VMCOREINFO contains CRASHTIME, the core dump is for a
+		// real crash, probably from kdump. Core dumps generated by
+		// kdump should have a PRSTATUS note for each CPU, in order by
+		// CPU number. There are a couple of complications:
+		//
+		// 1. Offline CPUs are skipped.
+		// 2. CPUs that don't respond to the kdump NMI are skipped.
+		//
+		// So, we can't reliably find the note for a given CPU solely
+		// from the note metadata. Instead, we get it directly from
+		// crash_notes, the per-CPU variable in the kernel where the
+		// notes are stored during a crash.
+		//
+		// s390x doesn't use crash_notes.
+		DRGN_OBJECT(tmp, prog);
+		err = drgn_program_find_object(prog, "crash_notes", NULL,
+					       DRGN_FIND_OBJECT_ANY, &tmp);
+		if (err)
+			return err;
+		err = linux_helper_per_cpu_ptr(&tmp, &tmp, cpu);
+		if (err)
+			return err;
+		err = drgn_object_dereference(&tmp, &tmp);
+		if (err)
+			return err;
+		err = drgn_object_read(&tmp, &tmp);
+		if (err)
+			return err;
+		if (tmp.encoding != DRGN_OBJECT_ENCODING_BUFFER) {
+			return drgn_error_create(DRGN_ERROR_LOOKUP,
+						 "could not parse crash_notes");
+		}
+
+		const void *p = drgn_object_buffer(&tmp);
+		size_t size = drgn_object_size(&tmp);
+		bool bswap = drgn_platform_bswap(&prog->platform);
+		GElf_Nhdr nhdr;
+		const char *name;
+		const void *desc;
+		while (next_elf_note(&p, &size, 4, bswap, &nhdr, &name, &desc)
+		       && nhdr.n_namesz > 0) {
+			if (nhdr.n_namesz == sizeof("CORE")
+			    && memcmp(name, "CORE", sizeof("CORE")) == 0
+			    && nhdr.n_type == NT_PRSTATUS) {
+				struct nstring prstatus = { desc, nhdr.n_descsz };
+				return drgn_get_initial_registers_from_prstatus(prog,
+										&prstatus,
+										ret);
+			}
+		}
+	} else {
+		// Either the VMCOREINFO doesn't contain CRASHTIME, so the core
+		// dump was captured while the kernel was running, or it is from
+		// kdump on s390x. In both cases, we can use the PRSTATUS note
+		// with a PID of CPU number + 1. (This assumes that other
+		// hypervisors do the same thing as QEMU dump-guest-memory,
+		// which may not be the case. QEMU itself as of version 9.1
+		// doesn't do it correctly on ppc64 or s390x:
+		// https://lore.kernel.org/linux-debuggers/cover.1718771802.git.osandov@osandov.com/T/).
+		struct nstring prstatus;
+		err = drgn_program_find_prstatus(prog, cpu + 1, &prstatus);
+		if (err)
+			return err;
+		if (prstatus.str) {
+			return drgn_get_initial_registers_from_prstatus(prog,
+									&prstatus,
+									ret);
+		}
+	}
+	return drgn_error_format(DRGN_ERROR_LOOKUP,
+				 "registers for CPU %" PRIu64 " were not saved",
+				 cpu);
+}
+
+static struct drgn_error *
 drgn_get_initial_registers(struct drgn_program *prog, uint32_t tid,
 			   const struct drgn_object *thread_obj,
 			   struct drgn_register_state **ret)
@@ -619,8 +770,14 @@ drgn_get_initial_registers(struct drgn_program *prog, uint32_t tid,
 		if (err)
 			return err;
 		if (!found) {
-			return drgn_error_create(DRGN_ERROR_LOOKUP,
-						 "task not found");
+			if (tid == 0) {
+				return drgn_error_create(DRGN_ERROR_LOOKUP,
+							 "task not found; "
+							 "use stack_trace(idle_task(cpu)) for PID 0");
+			} else {
+				return drgn_error_create(DRGN_ERROR_LOOKUP,
+							 "task not found");
+			}
 		}
 	}
 
@@ -651,44 +808,13 @@ drgn_get_initial_registers(struct drgn_program *prog, uint32_t tid,
 				return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
 							 "cannot unwind stack of running task");
 			}
-			// The PID field in PRSTATUS is unreliable for the
-			// kernel for multiple reasons:
-			//
-			// 1. Each CPU has its own idle task, all with PID 0.
-			// 2. Kdump on s390x populates the PID field with the
-			//    CPU number + 1.
-			// 3. QEMU's dump-guest-memory command does the same.
-			//
-			// So, for the kernel, we index the PRSTATUS notes by
-			// CPU number instead.
-			//
-			// Note that all of this is inherently racy: cpu_curr()
-			// [1], current [2], registers [3], and the stack
-			// pointer [4] are all updated at different times. This
-			// might result in confusing stack traces during a
-			// context switch, but there's not much we can do about
-			// that.
-			//
-			// 1: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/kernel/sched/core.c?h=v6.6#n6672
-			// 2: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/arch/x86/kernel/process_64.c?h=v6.6#n623
-			// 3: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/arch/x86/entry/entry_64.S?h=v6.6#n267
-			// 4: https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/arch/x86/entry/entry_64.S?h=v6.6#n249
 			uint64_t cpu;
 			err = linux_helper_task_cpu(&obj, &cpu);
 			if (err)
 				return err;
-			struct nstring prstatus;
-			err = drgn_program_find_prstatus_by_cpu(prog, cpu,
-								&prstatus);
-			if (err)
-				return err;
-			if (!prstatus.str) {
-				return drgn_error_format(DRGN_ERROR_LOOKUP,
-							 "CPU status not found; task_struct or core dump may be corrupted");
-			}
-			return drgn_get_initial_registers_from_prstatus(prog,
-									&prstatus,
-									ret);
+			return drgn_get_initial_registers_from_kernel_core_dump(prog,
+										cpu,
+										ret);
 		}
 		if (!prog->platform.arch->linux_kernel_get_initial_registers) {
 			return drgn_error_format(DRGN_ERROR_NOT_IMPLEMENTED,
@@ -699,7 +825,7 @@ drgn_get_initial_registers(struct drgn_program *prog, uint32_t tid,
 									       ret);
 	} else {
 		struct nstring prstatus;
-		err = drgn_program_find_prstatus_by_tid(prog, tid, &prstatus);
+		err = drgn_program_find_prstatus(prog, tid, &prstatus);
 		if (err)
 			return err;
 		if (!prstatus.str) {
@@ -890,7 +1016,7 @@ drgn_unwind_one_register(struct drgn_program *prog, struct drgn_elf_file *file,
 {
 	struct drgn_error *err;
 	bool little_endian = drgn_platform_is_little_endian(&prog->platform);
-	SWITCH_ENUM(rule->kind,
+	SWITCH_ENUM(rule->kind) {
 	case DRGN_CFI_RULE_UNDEFINED:
 		return &drgn_not_found;
 	case DRGN_CFI_RULE_AT_CFA_PLUS_OFFSET: {
@@ -948,7 +1074,9 @@ drgn_unwind_one_register(struct drgn_program *prog, struct drgn_elf_file *file,
 		copy_lsbytes(buf, size, little_endian, &rule->constant,
 			     sizeof(rule->constant), HOST_LITTLE_ENDIAN);
 		return NULL;
-	)
+	default:
+		UNREACHABLE();
+	}
 	/*
 	 * If we couldn't read from memory, leave the register unknown instead
 	 * of failing hard.
@@ -1054,6 +1182,17 @@ drgn_unwind_with_cfi(struct drgn_program *prog, struct drgn_cfi_row **row,
 	return NULL;
 }
 
+static bool drgn_is_bad_call(const struct drgn_register_state *regs)
+{
+	// If the program counter is 0, it's likely that a NULL function pointer
+	// was called. Other than that, it's difficult to differentiate a bad
+	// program counter from a valid program counter that we don't know about
+	// (e.g., because it's JIT compiled). We can add heuristics in the
+	// future.
+	struct optional_uint64 pc = drgn_register_state_get_pc(regs);
+	return pc.has_value && pc.value == 0;
+}
+
 static struct drgn_error *drgn_get_stack_trace(struct drgn_program *prog,
 					       uint32_t tid,
 					       const struct drgn_object *obj,
@@ -1066,10 +1205,13 @@ static struct drgn_error *drgn_get_stack_trace(struct drgn_program *prog,
 		return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
 					 "cannot unwind stack without platform");
 	}
-	if ((prog->flags & (DRGN_PROGRAM_IS_LINUX_KERNEL |
-			    DRGN_PROGRAM_IS_LIVE)) == DRGN_PROGRAM_IS_LIVE) {
+	if (drgn_program_is_userspace_process(prog)) {
 		return drgn_error_create(DRGN_ERROR_NOT_IMPLEMENTED,
 					 "stack unwinding is not yet supported for live processes");
+	} else if (!(prog->flags & DRGN_PROGRAM_IS_LINUX_KERNEL)
+		   && !drgn_program_is_userspace_core(prog)) {
+		return drgn_error_create(DRGN_ERROR_NOT_IMPLEMENTED,
+					 "stack unwinding is not supported for this program");
 	}
 
 	size_t trace_capacity = 1;
@@ -1102,8 +1244,16 @@ static struct drgn_error *drgn_get_stack_trace(struct drgn_program *prog,
 
 		err = drgn_unwind_with_cfi(prog, &row, regs, &regs);
 		if (err == &drgn_not_found) {
-			err = prog->platform.arch->fallback_unwind(prog, regs,
-								   &regs);
+			if (drgn_is_bad_call(regs)
+			    && prog->platform.arch->bad_call_unwind) {
+				err = prog->platform.arch->bad_call_unwind(prog,
+									   regs,
+									   &regs);
+			} else {
+				err = prog->platform.arch->fallback_unwind(prog,
+									   regs,
+									   &regs);
+			}
 		}
 		if (err == &drgn_stop)
 			break;
@@ -1185,13 +1335,9 @@ LIBDRGN_PUBLIC struct drgn_error *
 drgn_thread_stack_trace(struct drgn_thread *thread,
 			struct drgn_stack_trace **ret)
 {
-	if (thread->prog->flags & DRGN_PROGRAM_IS_LINUX_KERNEL) {
-		const struct nstring *prstatus =
-		        thread->prstatus.str ? &thread->prstatus : NULL;
-		return drgn_get_stack_trace(thread->prog, thread->tid,
-					    &thread->object, prstatus, ret);
-	} else {
-		return drgn_get_stack_trace(thread->prog, thread->tid, NULL,
-					    &thread->prstatus, ret);
-	}
+	return drgn_get_stack_trace(thread->prog, thread->tid,
+				    (thread->prog->flags & DRGN_PROGRAM_IS_LINUX_KERNEL)
+				    ? &thread->object : NULL,
+				    thread->prstatus.str ? &thread->prstatus : NULL,
+				    ret);
 }

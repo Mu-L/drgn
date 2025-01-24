@@ -13,7 +13,6 @@
 #define DRGN_ORC_INFO_H
 
 #include <stdbool.h>
-#include <stddef.h>
 #include <stdint.h>
 
 #include "cfi.h"
@@ -28,6 +27,16 @@ struct drgn_module;
 
 /** ORC unwinder data for a @ref drgn_module. */
 struct drgn_module_orc_info {
+	/**
+	 * Ranges where unwinding with ORC should be preferred over DWARF CFI,
+	 * sorted by start address.
+	 *
+	 * ORC may be preferred if configured by the user or for special ORC
+	 * entries; see drgn_raw_orc_entry_is_preferred().
+	 */
+	struct uint64_range *preferred;
+	/** Number of ranges in @ref preferred. */
+	size_t num_preferred;
 	/**
 	 * Base for calculating program counter corresponding to an ORC unwinder
 	 * entry.
@@ -66,6 +75,10 @@ struct drgn_module_orc_info {
 };
 
 void drgn_module_orc_info_deinit(struct drgn_module *module);
+
+struct drgn_error *drgn_module_parse_orc(struct drgn_module *module);
+
+bool drgn_module_should_prefer_orc_cfi(struct drgn_module *module, uint64_t pc);
 
 struct drgn_error *
 drgn_module_find_orc_cfi(struct drgn_module *module, uint64_t pc,

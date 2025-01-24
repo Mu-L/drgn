@@ -2,9 +2,6 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
 #include <elfutils/libdwfl.h>
-#ifdef WITH_KDUMPFILE
-#include <libkdumpfile/kdumpfile.h>
-#endif
 
 #include "drgnpy.h"
 #include "../path.h"
@@ -62,8 +59,8 @@ static PyObject *filename_matches(PyObject *self, PyObject *args,
 				  PyObject *kwds)
 {
 	static char *keywords[] = {"haystack", "needle", NULL};
-	struct path_arg haystack_arg = {.allow_none = true};
-	struct path_arg needle_arg = {.allow_none = true};
+	PATH_ARG(haystack_arg, .allow_none = true);
+	PATH_ARG(needle_arg, .allow_none = true);
 	if (!PyArg_ParseTupleAndKeywords(args, kwds, "O&O&:filename_matches",
 					 keywords, path_converter,
 					 &haystack_arg, path_converter,
@@ -88,10 +85,7 @@ static PyObject *filename_matches(PyObject *self, PyObject *args,
 		needle.components[0].len = needle_arg.length;
 		needle.num_components = 1;
 	}
-	bool ret = path_ends_with(&haystack, &needle);
-	path_cleanup(&haystack_arg);
-	path_cleanup(&needle_arg);
-	Py_RETURN_BOOL(ret);
+	Py_RETURN_BOOL(path_ends_with(&haystack, &needle));
 }
 
 static PyObject *sizeof_(PyObject *self, PyObject *arg)
@@ -107,6 +101,24 @@ static PyObject *sizeof_(PyObject *self, PyObject *arg)
 				    "expected Type or Object, not %s",
 				    Py_TYPE(arg)->tp_name);
 	}
+	if (err)
+		return set_drgn_error(err);
+	return PyLong_FromUint64(size);
+}
+
+static PyObject *alignof_(PyObject *self, PyObject *arg)
+{
+	struct drgn_error *err;
+	if (!PyObject_TypeCheck(arg, &DrgnType_type)) {
+		return PyErr_Format(PyExc_TypeError, "expected Type not %s",
+				    Py_TYPE(arg)->tp_name);
+	}
+	struct drgn_qualified_type qualified_type = {
+		.type = ((DrgnType *)arg)->type,
+		.qualifiers = ((DrgnType *)arg)->qualifiers,
+	};
+	uint64_t size;
+	err = drgn_type_alignof(qualified_type, &size);
 	if (err)
 		return set_drgn_error(err);
 	return PyLong_FromUint64(size);
@@ -139,10 +151,13 @@ static PyMethodDef drgn_methods[] = {
 	{"NULL", (PyCFunction)DrgnObject_NULL, METH_VARARGS | METH_KEYWORDS,
 	 drgn_NULL_DOC},
 	{"sizeof", (PyCFunction)sizeof_, METH_O, drgn_sizeof_DOC},
+	{"alignof", (PyCFunction)alignof_, METH_O, drgn_alignof_DOC},
 	{"offsetof", (PyCFunction)offsetof_, METH_VARARGS | METH_KEYWORDS,
 	 drgn_offsetof_DOC},
 	{"cast", (PyCFunction)cast, METH_VARARGS | METH_KEYWORDS,
 	 drgn_cast_DOC},
+	{"implicit_convert", (PyCFunction)implicit_convert,
+	 METH_VARARGS | METH_KEYWORDS, drgn_implicit_convert_DOC},
 	{"reinterpret", (PyCFunction)reinterpret, METH_VARARGS | METH_KEYWORDS,
 	 drgn_reinterpret_DOC},
 	{"container_of", (PyCFunction)DrgnObject_container_of,
@@ -162,13 +177,16 @@ static PyMethodDef drgn_methods[] = {
 	 METH_VARARGS | METH_KEYWORDS},
 	{"_linux_helper_per_cpu_ptr",
 	 (PyCFunction)drgnpy_linux_helper_per_cpu_ptr,
-	 METH_VARARGS | METH_KEYWORDS},
+	 METH_VARARGS | METH_KEYWORDS, drgn__linux_helper_per_cpu_ptr_DOC},
 	{"_linux_helper_cpu_curr", (PyCFunction)drgnpy_linux_helper_cpu_curr,
 	 METH_VARARGS},
 	{"_linux_helper_idle_task", (PyCFunction)drgnpy_linux_helper_idle_task,
 	 METH_VARARGS},
+	{"_linux_helper_task_thread_info",
+	 (PyCFunction)drgnpy_linux_helper_task_thread_info,
+	 METH_VARARGS | METH_KEYWORDS, drgn__linux_helper_task_thread_info_DOC},
 	{"_linux_helper_task_cpu", (PyCFunction)drgnpy_linux_helper_task_cpu,
-	 METH_VARARGS | METH_KEYWORDS},
+	 METH_VARARGS | METH_KEYWORDS, drgn__linux_helper_task_cpu_DOC},
 	{"_linux_helper_xa_load",
 	 (PyCFunction)drgnpy_linux_helper_xa_load,
 	 METH_VARARGS | METH_KEYWORDS},
@@ -177,13 +195,19 @@ static PyMethodDef drgn_methods[] = {
 	{"_linux_helper_find_pid", (PyCFunction)drgnpy_linux_helper_find_pid,
 	 METH_VARARGS},
 	{"_linux_helper_pid_task", (PyCFunction)drgnpy_linux_helper_pid_task,
-	 METH_VARARGS | METH_KEYWORDS},
+	 METH_VARARGS | METH_KEYWORDS, drgn__linux_helper_pid_task_DOC},
 	{"_linux_helper_find_task", (PyCFunction)drgnpy_linux_helper_find_task,
 	 METH_VARARGS},
 	{"_linux_helper_kaslr_offset", drgnpy_linux_helper_kaslr_offset,
 	 METH_O},
 	{"_linux_helper_pgtable_l5_enabled",
 	 drgnpy_linux_helper_pgtable_l5_enabled, METH_O},
+	{"_linux_helper_load_proc_kallsyms",
+	 (PyCFunction)drgnpy_linux_helper_load_proc_kallsyms,
+	 METH_VARARGS | METH_KEYWORDS},
+	{"_linux_helper_load_builtin_kallsyms",
+	 (PyCFunction)drgnpy_linux_helper_load_builtin_kallsyms,
+	 METH_VARARGS | METH_KEYWORDS},
 	{},
 };
 
@@ -266,6 +290,17 @@ DRGNPY_PUBLIC PyMODINIT_FUNC PyInit__drgn(void)
 	if (add_module_constants(m) ||
 	    add_type(m, &Language_type) || add_languages() ||
 	    add_type(m, &DrgnObject_type) ||
+	    add_type(m, &Module_type) ||
+	    add_type(m, &MainModule_type) ||
+	    add_type(m, &SharedLibraryModule_type) ||
+	    add_type(m, &VdsoModule_type) ||
+	    add_type(m, &RelocatableModule_type) ||
+	    add_type(m, &ExtraModule_type) ||
+	    PyType_Ready(&ModuleIterator_type) ||
+	    PyType_Ready(&ModuleIteratorWithNew_type) ||
+	    add_WantedSupplementaryFile(m) ||
+	    init_module_section_addresses() ||
+	    PyType_Ready(&ModuleSectionAddressesIterator_type) ||
 	    PyType_Ready(&ObjectIterator_type) ||
 	    add_type(m, &Platform_type) ||
 	    add_type(m, &Program_type) ||
@@ -273,10 +308,14 @@ DRGNPY_PUBLIC PyMODINIT_FUNC PyInit__drgn(void)
 	    add_type(m, &StackFrame_type) ||
 	    add_type(m, &StackTrace_type) ||
 	    add_type(m, &Symbol_type) ||
+	    add_type(m, &SymbolIndex_type) ||
 	    add_type(m, &DrgnType_type) ||
 	    add_type(m, &Thread_type) ||
 	    add_type(m, &ThreadIterator_type) ||
 	    add_type(m, &TypeEnumerator_type) ||
+	    add_type(m, &TypeKindSet_type) ||
+	    PyType_Ready(&TypeKindSetIterator_type) ||
+	    init_type_kind_set() ||
 	    add_type(m, &TypeMember_type) ||
 	    add_type(m, &TypeParameter_type) ||
 	    add_type(m, &TypeTemplateParameter_type) ||

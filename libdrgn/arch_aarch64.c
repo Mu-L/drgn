@@ -129,6 +129,31 @@ fallback_unwind_aarch64(struct drgn_program *prog,
 	return NULL;
 }
 
+// Unwind a single bl or blr instruction.
+static struct drgn_error *
+bad_call_unwind_aarch64(struct drgn_program *prog,
+			struct drgn_register_state *regs,
+			struct drgn_register_state **ret)
+{
+	struct optional_uint64 lr =
+		drgn_register_state_get_u64(prog, regs, x30);
+	if (!lr.has_value)
+		return &drgn_stop;
+
+	struct drgn_register_state *tmp = drgn_register_state_dup(regs);
+	if (!tmp)
+		return &drgn_enomem;
+
+	// lr contains the the old pc + 4.
+	drgn_register_state_set_pc(prog, tmp, lr.value - 4);
+	// We don't know the old lr.
+	drgn_register_state_unset_has_register(tmp, DRGN_REGISTER_NUMBER(x30));
+	// The interrupted pc is no longer applicable.
+	drgn_register_state_unset_has_register(tmp, DRGN_REGISTER_NUMBER(pc));
+	*ret = tmp;
+	return NULL;
+}
+
 // elf_gregset_t (in PRSTATUS) and struct user_pt_regs have the same layout.
 // This layout is a prefix of the in-kernel struct pt_regs (but we don't care
 // about any of the extra fields).
@@ -265,6 +290,7 @@ apply_elf_reloc_aarch64(const struct drgn_relocating_section *relocating,
 
 struct pgtable_iterator_aarch64 {
 	struct pgtable_iterator it;
+	uint64_t va_bits;
 	// Inclusive range of valid virtual addresses.
 	uint64_t va_range_min, va_range_max;
 	int levels;
@@ -274,6 +300,7 @@ struct pgtable_iterator_aarch64 {
 	uint64_t table[5];
 	uint64_t pa_low_mask;
 	uint64_t pa_high_mask;
+	int pa_high_shift;
 };
 
 static struct drgn_error *
@@ -287,46 +314,52 @@ linux_kernel_pgtable_iterator_create_aarch64(struct drgn_program *prog,
 	}
 	const uint64_t pgtable_shift = page_shift - 3;
 
-	// Since Linux kernel commit b6d00d47e81a ("arm64: mm: Introduce 52-bit
-	// Kernel VAs") (in v5.4), VA_BITS is the maximum virtual address size.
-	// If the kernel is configured with 52-bit virtual addresses but the
-	// hardware does not support it, the kernel falls back to 48-bit virtual
-	// addresses. Note that 64k pages with either 48- or 52-bit virtual
-	// addresses uses a 3-level page table.
+	// VA_BITS in VMCOREINFO, added in Linux kernel commit 20a166243328
+	// ("arm64: kdump: add VMCOREINFO's for user-space tools") (in v4.12),
+	// is the configured virtual address size. Since Linux kernel commit
+	// b6d00d47e81a ("arm64: mm: Introduce 52-bit Kernel VAs") (in v5.4), it
+	// may be greater than the actual size used at runtime if the kernel is
+	// configured with 52-bit virtual addresses but the hardware does not
+	// support it. 64 - TCR_EL1_T1SZ, added in Linux kernel commit
+	// bbdbc11804ff ("arm64/crash_core: Export TCR_EL1.T1SZ in vmcoreinfo")
+	// (in v5.9), is the size used at runtime.
 	//
-	// In the 52- to 48-bit fallback case, swapper_pg_dir is still set up
-	// for 52-bit virtual addresses (an offset is applied when loading it
-	// into TTBR1; see Linux kernel commit c812026c54cf ("arm64: mm: Logic
-	// to make offset_ttbr1 conditional") (in v5.4)). So, we can treat
-	// kernel addresses as if they have size VA_BITS for the purposes of
-	// translating using swapper_pg_dir.
+	// With 64k pages, if 52-bit virtual addresses are not supported
+	// (Armv8.2 FEAT_LVA), then the kernel falls back to 48-bit virtual
+	// addresses. Note that the page table has 3 levels with either size. In
+	// this case, swapper_pg_dir is still set up for 52-bit virtual
+	// addresses (an offset is applied when loading swapper_pg_dir into
+	// TTBR1; see Linux kernel commit c812026c54cf ("arm64: mm: Logic to
+	// make offset_ttbr1 conditional") (in v5.4)). So, with 64k pages, we
+	// need to treat kernel addresses as if they have size VA_BITS for the
+	// purposes of translating using swapper_pg_dir. We can also treat user
+	// addresses as if they have size VA_BITS. In the 52- to 48-bit fallback
+	// case, the additional user virtual address bits [51:48] are zero, so
+	// the page table is accessed identically.
 	//
-	// We can also treat user addresses as if they have size VA_BITS. In the
-	// 52- to 48-bit fallback case, the additional user virtual address bits
-	// [51:48] are zero, so the page table is accessed identically.
-	//
-	// Between 67e7fdfcc682 ("arm64: mm: introduce 52-bit userspace
-	// support") (in v5.0) and Linux kernel commit b6d00d47e81a ("arm64: mm:
-	// Introduce 52-bit Kernel VAs") (in v5.4), userspace could have larger
-	// virtual addresses than kernel space, but we don't support any of
-	// those kernels.
-	//
-	// Note that Linux as of v5.19 only supports 52-bit virtual addresses
-	// with 64k pages (Armv8.2 FEAT_LVA). When Linux adds support for 52-bit
-	// virtual addresses with 4k pages (Armv8.2 LPA2), this might need
-	// special handling, since with 4k pages, 48- and 52-bit virtual
-	// addresses require a different number of page table levels (4 vs. 5,
-	// respectively).
-	uint64_t va_bits = prog->vmcoreinfo.va_bits;
+	// With 4k or 16k pages, if 52-bit virtual addresses are not supported
+	// (Armv8.7 FEAT_LPA2), then the kernel falls back to 48-bit virtual
+	// addresses with 4k pages or 47-bit virtual addresses with 16k pages;
+	// see Linux kernel commit 0dd4f60a2c76 ("arm64: mm: Add support for
+	// folding PUDs at runtime") (in v6.9). This decreases the number of
+	// page table levels (from 5 to 4 for 4k pages and from 4 to 3 for 16k
+	// pages). In this case, we need to use the actual size for both kernel
+	// and user addresses, 64 - TCR_EL1_T1SZ.
+	uint64_t va_bits;
+	if (page_shift == 16 || !prog->vmcoreinfo.tcr_el1_t1sz)
+		va_bits = prog->vmcoreinfo.va_bits;
+	else
+		va_bits = 64 - prog->vmcoreinfo.tcr_el1_t1sz;
 	if (va_bits <= page_shift || va_bits > 52) {
 		return drgn_error_create(DRGN_ERROR_OTHER,
-					 "VMCOREINFO does not contain valid VA_BITS");
+					 "VMCOREINFO does not contain valid TCR_EL1_T1SZ or VA_BITS");
 	}
 
 	struct pgtable_iterator_aarch64 *it = malloc(sizeof(*it));
 	if (!it)
 		return &drgn_enomem;
 
+	it->va_bits = va_bits;
 	it->levels = ((va_bits - page_shift + pgtable_shift - 1) /
 		      pgtable_shift);
 	assert(it->levels <= array_size(it->table));
@@ -340,20 +373,35 @@ linux_kernel_pgtable_iterator_create_aarch64(struct drgn_program *prog,
 	// For 52-bit physical addresses, physical address bits [51:48] come
 	// from elsewhere.
 	//
-	// With 64k pages and Armv8.2 FEAT_LPA, descriptor bits [15:12] contain
-	// physical address bits [51:48]. If FEAT_LPA is not enabled, then bits
-	// [15:12] must be 0. So, if we're using 64k pages, we can always get
-	// those bits without doing feature detection.
+	// With 64k pages and 52-bit physical addresses (Armv8.2 FEAT_LPA),
+	// descriptor bits [15:12] contain physical address bits [51:48]. With
+	// 64k pages and 48-bit physical addresses, descriptor bits [15:12] must
+	// be 0. So, if we're using 64k pages, we can always get those bits
+	// without knowing the physical address size.
 	//
-	// With 4k or 16k pages and Armv8.7 FEAT_LPA2, descriptor bits [48:49]
-	// contain physical address bits [48:49] and descriptor bits [9:8]
-	// contain physical address bits [51:50]. However, if FEAT_LPA2 is not
-	// enabled, then descriptor bits [9:8] are used for other purposes.
-	// Linux as of v5.19 does not support FEAT_LPA2. When support is added,
-	// we will need to do feature detection.
+	// With 4k or 16k pages and 52-bit physical addresses (Armv8.7
+	// FEAT_LPA2), descriptor bits [49:48] contain physical address bits
+	// [49:48] and descriptor bits [9:8] contain physical address bits
+	// [51:50]. However, with 4k or 16k pages and 48-bit physical addresses,
+	// descriptor bits [9:8] are used for other purposes. We need to know
+	// the physical address size, but it is not reported in VMCOREINFO.
+	// However, we can check the virtual address size, as with 4k or 16k
+	// pages, the kernel requires that it is equal to the physical address
+	// size; see Linux kernel commit 352b0395b505 ("arm64: Enable 52-bit
+	// virtual addressing for 4k and 16k granule configs") (in v6.9).
 	it->pa_low_mask = (UINT64_C(0x0000ffffffffffff)
 			   & ~(prog->vmcoreinfo.page_size - 1));
-	it->pa_high_mask = page_shift < 16 ? 0x0 : 0xf000;
+	if (page_shift == 16) {
+		it->pa_high_mask = 0xf000;
+		it->pa_high_shift = 36;
+	} else if (va_bits == 52) {
+		it->pa_low_mask |= UINT64_C(0x0003000000000000);
+		it->pa_high_mask = 0x300;
+		it->pa_high_shift = 42;
+	} else {
+		it->pa_high_mask = 0x0;
+		it->pa_high_shift = 0;
+	}
 
 	*ret = &it->it;
 	return NULL;
@@ -372,12 +420,11 @@ static void linux_kernel_pgtable_iterator_init_aarch64(struct drgn_program *prog
 	struct pgtable_iterator_aarch64 *it =
 		container_of(_it, struct pgtable_iterator_aarch64, it);
 	if (it->it.pgtable == prog->vmcoreinfo.swapper_pg_dir) {
-		it->va_range_min = UINT64_MAX << prog->vmcoreinfo.va_bits;
+		it->va_range_min = UINT64_MAX << it->va_bits;
 		it->va_range_max = UINT64_MAX;
 	} else {
 		it->va_range_min = 0;
-		it->va_range_max =
-			(UINT64_C(1) << prog->vmcoreinfo.va_bits) - 1;
+		it->va_range_max = (UINT64_C(1) << it->va_bits) - 1;
 	}
 
 	it->cached_virt_addr = 0;
@@ -429,7 +476,7 @@ linux_kernel_pgtable_iterator_next_aarch64(struct drgn_program *prog,
 
 		num_entries = it->entries_per_level;
 		table = ((entry & it->pa_low_mask) |
-			 (entry & it->pa_high_mask) << 36);
+			 (entry & it->pa_high_mask) << it->pa_high_shift);
 
 		// Descriptor bits [1:0] identify the descriptor type:
 		//
@@ -464,10 +511,12 @@ const struct drgn_architecture_info arch_info_aarch64 = {
 	.arch = DRGN_ARCH_AARCH64,
 	.default_flags = (DRGN_PLATFORM_IS_64_BIT |
 			  DRGN_PLATFORM_IS_LITTLE_ENDIAN),
+	.scalar_alignment = { 1, 2, 4, 8, 16 },
 	DRGN_ARCHITECTURE_REGISTERS,
 	.default_dwarf_cfi_row = &default_dwarf_cfi_row_aarch64,
 	.demangle_cfi_registers = demangle_cfi_registers_aarch64,
 	.fallback_unwind = fallback_unwind_aarch64,
+	.bad_call_unwind = bad_call_unwind_aarch64,
 	.pt_regs_get_initial_registers = pt_regs_get_initial_registers_aarch64,
 	.prstatus_get_initial_registers = prstatus_get_initial_registers_aarch64,
 	.linux_kernel_get_initial_registers =

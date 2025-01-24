@@ -1,7 +1,7 @@
 dnl Copyright (c) Meta Platforms, Inc. and affiliates.
 dnl SPDX-License-Identifier: LGPL-2.1-or-later
 
-AC_INIT([libdrgn], [0.0.25],
+AC_INIT([libdrgn], [0.0.30],
 	[https://github.com/osandov/drgn/issues],,
 	[https://github.com/osandov/drgn])
 
@@ -9,7 +9,7 @@ AC_CONFIG_AUX_DIR([build-aux])
 AC_CONFIG_MACRO_DIR([m4])
 AC_PROG_CC
 
-AM_INIT_AUTOMAKE([-Wall -Wno-portability foreign subdir-objects])
+AM_INIT_AUTOMAKE([-Wall -Wno-portability foreign nostdinc subdir-objects])
 AM_SILENT_RULES([yes])
 AM_PROG_AR
 
@@ -17,7 +17,11 @@ LT_INIT
 
 AC_SYS_LARGEFILE
 
+AC_REQUIRE_AUX_FILE([tap-driver.sh])
+
 MY_C_AUTO
+MY_C_SWITCH_ENUM
+MY_CHECK_VA_ARGS_COMMA_DELETION
 
 AC_ARG_ENABLE([openmp],
 	      [AS_HELP_STRING([--enable-openmp@<:@=ARG@:>@],
@@ -77,6 +81,29 @@ PKG_PROG_PKG_CONFIG
 
 PKG_CHECK_MODULES(elfutils, [libelf >= 0.165 libdw >= 0.165])
 
+AC_ARG_WITH([debuginfod],
+	    [AS_HELP_STRING([--with-debuginfod],
+			    [build with support for debuginfod
+			     @<:@default=auto@:>@])],
+			     [], [with_debuginfod=auto])
+AS_CASE(["x$with_debuginfod"],
+	[xyes], [PKG_CHECK_MODULES(libdebuginfod, [libdebuginfod])],
+	[xauto], [PKG_CHECK_MODULES(libdebuginfod, [libdebuginfod],
+				    [with_debuginfod=yes],
+				    [with_debuginfod=no])])
+AM_CONDITIONAL([WITH_DEBUGINFOD], [test "x$with_debuginfod" != xno])
+AM_COND_IF([WITH_DEBUGINFOD], [AC_DEFINE(WITH_DEBUGINFOD)])
+
+AC_ARG_ENABLE([dlopen-debuginfod],
+	      [AS_HELP_STRING([--disable-dlopen-debuginfod],
+			      [if building with support for debuginfod, link
+			       against libdebuginfod instead of loading it with
+			       dlopen(3)])],
+	      [], [enable_dlopen_debuginfod=yes])
+AM_CONDITIONAL([ENABLE_DLOPEN_DEBUGINFOD],
+	       [test "x$enable_dlopen_debuginfod" != xno])
+AM_COND_IF([ENABLE_DLOPEN_DEBUGINFOD], [AC_DEFINE(ENABLE_DLOPEN_DEBUGINFOD)])
+
 AC_ARG_WITH([libkdumpfile],
 	    [AS_HELP_STRING([--with-libkdumpfile],
 			    [build with support for the makedumpfile kernel
@@ -90,6 +117,13 @@ AS_CASE(["x$with_libkdumpfile"],
 				    [with_libkdumpfile=no])])
 AM_CONDITIONAL([WITH_LIBKDUMPFILE], [test "x$with_libkdumpfile" = xyes])
 AM_COND_IF([WITH_LIBKDUMPFILE], [AC_DEFINE(WITH_LIBKDUMPFILE)])
+
+dnl We need check for running tests, but we don't want to fail the build over
+dnl it. Instead, if it's not found, set variables so that only `make check`
+dnl fails.
+PKG_CHECK_MODULES(check, [check >= 0.10.0],,
+		  [check_CFLAGS="\$(error Test requires 'check' ('check-devel') >= 0.10.0)"
+		   check_LIBS="\$(error Test requires 'check' ('check-devel') >= 0.10.0)"])
 
 AC_ARG_ENABLE([compiler-warnings],
 	      [AS_HELP_STRING([--enable-compiler-warnings@<:@=no|yes|error@:>@],
@@ -109,9 +143,12 @@ AS_IF([test "x$enable_compiler_warnings" != xno],
       [AX_APPEND_COMPILE_FLAGS([ dnl
        -Wall dnl
        -Wformat-overflow=2 dnl
+       -Wformat-security dnl
        -Wformat-truncation=2 dnl
        -Wimplicit-fallthrough dnl
        -Wmissing-prototypes dnl
+       -Wpointer-arith dnl
+       -Wshadow dnl
        -Wvla dnl
        -Wno-format-zero-length dnl
        ], [WARN_CFLAGS], [$compiler_flags_test])])

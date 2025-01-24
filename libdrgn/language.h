@@ -12,7 +12,7 @@
 #ifndef DRGN_LANGUAGE_H
 #define DRGN_LANGUAGE_H
 
-#include "drgn.h"
+#include "drgn_internal.h"
 
 /**
  * @ingroup Internals
@@ -133,6 +133,7 @@ struct drgn_language {
 	 */
 	drgn_float_literal_fn *float_literal;
 	drgn_cast_op *op_cast;
+	drgn_cast_op *op_implicit_convert;
 	drgn_bool_op *op_bool;
 	drgn_cmp_op *op_cmp;
 	drgn_binary_op *op_add;

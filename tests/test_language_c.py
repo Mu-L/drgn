@@ -1,7 +1,6 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # SPDX-License-Identifier: LGPL-2.1-or-later
 from functools import reduce
-from itertools import chain
 import operator
 
 from drgn import (
@@ -13,9 +12,9 @@ from drgn import (
     TypeParameter,
     cast,
     container_of,
+    implicit_convert,
 )
-from tests import MockProgramTestCase, TestCase
-from tests.libdrgn import C_TOKEN, Lexer, drgn_c_family_lexer_func
+from tests import MockProgramTestCase
 
 
 class TestPrettyPrintTypeName(MockProgramTestCase):
@@ -711,169 +710,6 @@ typedef struct {
         )
 
 
-class TestLexer(TestCase):
-    def lex(self, s, cpp=False):
-        lexer = Lexer(drgn_c_family_lexer_func, s, cpp)
-        while True:
-            token = lexer.pop()
-            if token.kind == C_TOKEN.EOF:
-                break
-            yield token
-
-    def test_empty(self):
-        lexer = Lexer(drgn_c_family_lexer_func, "")
-        for i in range(64):
-            self.assertEqual(lexer.pop().kind, C_TOKEN.EOF)
-
-    def test_symbols(self):
-        s = "()[]*."
-        tokens = [
-            C_TOKEN.LPAREN,
-            C_TOKEN.RPAREN,
-            C_TOKEN.LBRACKET,
-            C_TOKEN.RBRACKET,
-            C_TOKEN.ASTERISK,
-            C_TOKEN.DOT,
-        ]
-        self.assertEqual([token.kind for token in self.lex(s)], tokens)
-
-    def test_keywords(self):
-        s = """void char short int long signed unsigned _Bool float double
-        _Complex const restrict volatile _Atomic struct union class enum"""
-        tokens = [
-            C_TOKEN.VOID,
-            C_TOKEN.CHAR,
-            C_TOKEN.SHORT,
-            C_TOKEN.INT,
-            C_TOKEN.LONG,
-            C_TOKEN.SIGNED,
-            C_TOKEN.UNSIGNED,
-            C_TOKEN.BOOL,
-            C_TOKEN.FLOAT,
-            C_TOKEN.DOUBLE,
-            C_TOKEN.COMPLEX,
-            C_TOKEN.CONST,
-            C_TOKEN.RESTRICT,
-            C_TOKEN.VOLATILE,
-            C_TOKEN.ATOMIC,
-            C_TOKEN.STRUCT,
-            C_TOKEN.UNION,
-            C_TOKEN.IDENTIFIER,
-            C_TOKEN.ENUM,
-        ]
-        self.assertEqual([token.kind for token in self.lex(s)], tokens)
-
-    def test_cpp_keywords(self):
-        s = """void char short int long signed unsigned _Bool float double
-        _Complex const restrict volatile _Atomic struct union class enum"""
-        tokens = [
-            C_TOKEN.VOID,
-            C_TOKEN.CHAR,
-            C_TOKEN.SHORT,
-            C_TOKEN.INT,
-            C_TOKEN.LONG,
-            C_TOKEN.SIGNED,
-            C_TOKEN.UNSIGNED,
-            C_TOKEN.BOOL,
-            C_TOKEN.FLOAT,
-            C_TOKEN.DOUBLE,
-            C_TOKEN.COMPLEX,
-            C_TOKEN.CONST,
-            C_TOKEN.RESTRICT,
-            C_TOKEN.VOLATILE,
-            C_TOKEN.ATOMIC,
-            C_TOKEN.STRUCT,
-            C_TOKEN.UNION,
-            C_TOKEN.CLASS,
-            C_TOKEN.ENUM,
-        ]
-        self.assertEqual([token.kind for token in self.lex(s, cpp=True)], tokens)
-
-    def test_cpp_identifiers_with_template_parameters(self):
-        token_pairs = (
-            ("vector", "<int>"),
-            ("pair", "<int, double>"),
-            ("unordered_map", "<std::string, std::vector<pair<short, bool>>>"),
-            ("IntLiteral", "<123>"),
-            ("IntLiteralWithSuffix", "<123UL>"),
-            ("FloatLiteral", "<1.987>"),
-            ("FloatLiteralWithExponent", "<1.23423e+1f>"),
-            ("PointerLiteral", "<&asdf>"),
-            ("ParenthesizedPointerLiteral", "<(&asdf)>"),
-            ("CharLiteral", "<'a'>"),
-            ("CharLiteralEdgeCase1", "<'<'>"),
-            ("CharLiteralEdgeCase2", "<'>'>"),
-            ("CharLiteralEdgeCase3", r"<'\''>"),
-        )
-        self.assertEqual(
-            [
-                (token.kind, token.value)
-                for token in self.lex(
-                    " ".join("".join(pair) for pair in token_pairs), cpp=True
-                )
-            ],
-            [
-                (C_TOKEN.TEMPLATE_ARGUMENTS if i % 2 else C_TOKEN.IDENTIFIER, value)
-                for i, value in enumerate(chain.from_iterable(token_pairs))
-            ],
-        )
-
-    def test_cpp_identifiers_with_invalid_template_parameters(self):
-        for s in [
-            "vector<int",
-            "pair<<int, double>",
-            "unordered_map<string, vector<pair<short, bool>>",
-        ]:
-            self.assertRaisesRegex(
-                SyntaxError,
-                "invalid template arguments",
-                list,
-                self.lex(s, cpp=True),
-            )
-        for s in [
-            "vectorint>",
-            "pair<int, double>>",
-        ]:
-            self.assertRaisesRegex(
-                SyntaxError,
-                "invalid character",
-                list,
-                self.lex(s, cpp=True),
-            )
-
-    def test_identifiers(self):
-        s = "_ x foo _bar baz1"
-        tokens = s.split()
-        self.assertEqual(
-            [(token.kind, token.value) for token in self.lex(s)],
-            [(C_TOKEN.IDENTIFIER, value) for value in tokens],
-        )
-
-    def test_almost_keywords(self):
-        s = """voi cha shor in lon signe unsigne _Boo floa doubl
-        _Comple cons restric volatil _Atomi struc unio enu"""
-        tokens = s.split()
-        self.assertEqual(
-            [(token.kind, token.value) for token in self.lex(s)],
-            [(C_TOKEN.IDENTIFIER, value) for value in tokens],
-        )
-
-    def test_number(self):
-        s = "0 1234 0xdeadbeef"
-        tokens = s.split()
-        self.assertEqual(
-            [(token.kind, token.value) for token in self.lex(s)],
-            [(C_TOKEN.NUMBER, value) for value in tokens],
-        )
-
-    def test_invalid_number(self):
-        for s in ["0x", "1234y"]:
-            self.assertRaisesRegex(SyntaxError, "invalid number", list, self.lex(s))
-
-    def test_invalid_character(self):
-        self.assertRaisesRegex(SyntaxError, "invalid character", list, self.lex("@"))
-
-
 class TestLiteral(MockProgramTestCase):
     def test_int(self):
         self.assertIdentical(
@@ -928,7 +764,11 @@ class TestLiteral(MockProgramTestCase):
             pass
 
         self.assertRaisesRegex(
-            TypeError, "cannot create Foo literal", Object, self.prog, value=Foo()
+            TypeError,
+            "literal must be int, float, or bool, not 'Foo'",
+            Object,
+            self.prog,
+            value=Foo(),
         )
 
 
@@ -1278,6 +1118,27 @@ class TestCommonRealType(MockProgramTestCase):
 
 
 class TestOperators(MockProgramTestCase):
+    def test_bool_arrays(self):
+        self.assertTrue(Object(self.prog, "int [2]", [0, 0]))
+        self.assertTrue(Object(self.prog, "int [0]", address=0x1234))
+        self.assertFalse(Object(self.prog, "int [2]", address=0))
+
+    def test_bool_functions(self):
+        self.assertTrue(
+            Object(
+                self.prog,
+                self.prog.function_type(self.prog.type("void"), ()),
+                address=0x1234,
+            )
+        )
+        self.assertFalse(
+            Object(
+                self.prog,
+                self.prog.function_type(self.prog.type("void"), ()),
+                address=0,
+            )
+        )
+
     def test_cast_array(self):
         obj = Object(self.prog, "int []", address=0xFFFF0000)
         self.assertIdentical(
@@ -1302,6 +1163,34 @@ class TestOperators(MockProgramTestCase):
         )
         self.assertIdentical(
             cast("void *", func), Object(self.prog, "void *", value=0xFFFF0000)
+        )
+
+    def test_cast_to_void(self):
+        self.assertIdentical(
+            cast("void", Object(self.prog, "int", 0)), Object(self.prog, "void")
+        )
+        self.assertIdentical(
+            cast("void", Object(self.prog, "int [2]")), Object(self.prog, "void")
+        )
+
+    def test_cast_to_bool(self):
+        self.assertIdentical(
+            cast("_Bool", Object(self.prog, "int", 0)),
+            Object(self.prog, "_Bool", False),
+        )
+        for value in (1, -1, 2, 256, 32767):
+            with self.subTest(value=value):
+                self.assertIdentical(
+                    cast("_Bool", Object(self.prog, "int", value)),
+                    Object(self.prog, "_Bool", True),
+                )
+        self.assertIdentical(
+            cast("_Bool", Object(self.prog, "void *", 0)),
+            Object(self.prog, "_Bool", False),
+        )
+        self.assertIdentical(
+            cast("_Bool", Object(self.prog, "void *", 1)),
+            Object(self.prog, "_Bool", True),
         )
 
     def _test_arithmetic(
@@ -1760,6 +1649,767 @@ class TestOperators(MockProgramTestCase):
             self.assertRaisesRegex(
                 SyntaxError, error, container_of, obj, type_, member_designator
             )
+
+
+class TestImplicitConvert(MockProgramTestCase):
+    def test_to_bool(self):
+        self.assertIdentical(
+            implicit_convert("_Bool", Object(self.prog, "int", 0)),
+            Object(self.prog, "_Bool", False),
+        )
+        for value in (1, -1, 2, 256, 32767):
+            with self.subTest(value=value):
+                self.assertIdentical(
+                    implicit_convert("_Bool", Object(self.prog, "int", value)),
+                    Object(self.prog, "_Bool", True),
+                )
+        self.assertIdentical(
+            implicit_convert("_Bool", Object(self.prog, "void *", 0)),
+            Object(self.prog, "_Bool", False),
+        )
+        self.assertIdentical(
+            implicit_convert("_Bool", Object(self.prog, "void *", 1)),
+            Object(self.prog, "_Bool", True),
+        )
+
+    def test_to_int(self):
+        self.assertIdentical(
+            implicit_convert("int", Object(self.prog, "unsigned long", 1234)),
+            Object(self.prog, "int", 1234),
+        )
+        self.assertIdentical(
+            implicit_convert("int", Object(self.prog, "double", 3.5)),
+            Object(self.prog, "int", 3),
+        )
+        self.assertIdentical(
+            implicit_convert("int", Object(self.prog, "_Bool", False)),
+            Object(self.prog, "int", 0),
+        )
+        self.assertIdentical(
+            implicit_convert("int", Object(self.prog, self.color_type, 2)),
+            Object(self.prog, "int", 2),
+        )
+
+    def test_to_float(self):
+        self.assertIdentical(
+            implicit_convert("double", Object(self.prog, "unsigned long", 1234)),
+            Object(self.prog, "double", 1234.0),
+        )
+        self.assertIdentical(
+            implicit_convert("double", Object(self.prog, "float", 3.5)),
+            Object(self.prog, "double", 3.5),
+        )
+        self.assertIdentical(
+            implicit_convert("double", Object(self.prog, "_Bool", False)),
+            Object(self.prog, "double", 0.0),
+        )
+        self.assertIdentical(
+            implicit_convert("double", Object(self.prog, self.color_type, 2)),
+            Object(self.prog, "double", 2.0),
+        )
+
+    def test_to_enum(self):
+        self.assertIdentical(
+            implicit_convert(self.color_type, Object(self.prog, "unsigned long", 1)),
+            Object(self.prog, self.color_type, 1),
+        )
+        self.assertIdentical(
+            implicit_convert(self.color_type, Object(self.prog, "double", 3.5)),
+            Object(self.prog, self.color_type, 3),
+        )
+        self.assertIdentical(
+            implicit_convert(self.color_type, Object(self.prog, "_Bool", False)),
+            Object(self.prog, self.color_type, 0),
+        )
+        self.assertIdentical(
+            implicit_convert(self.color_type, Object(self.prog, self.color_type, 2)),
+            Object(self.prog, self.color_type, 2),
+        )
+
+    def test_to_int_typedef(self):
+        self.assertIdentical(
+            implicit_convert(
+                self.prog.typedef_type("INT", self.prog.type("int")),
+                Object(self.prog, "int", 1234),
+            ),
+            Object(
+                self.prog, self.prog.typedef_type("INT", self.prog.type("int")), 1234
+            ),
+        )
+
+    def test_struct_to_self(self):
+        self.assertIdentical(
+            implicit_convert(
+                self.prog.struct_type(
+                    "point",
+                    8,
+                    (
+                        TypeMember(self.prog.int_type("int", 4, True), "x", 0),
+                        TypeMember(self.prog.int_type("int", 4, True), "y", 32),
+                    ),
+                ),
+                Object(self.prog, self.point_type, {"x": 1, "y": 2}),
+            ),
+            Object(self.prog, self.point_type, {"x": 1, "y": 2}),
+        )
+        self.assertIdentical(
+            implicit_convert(
+                self.point_type.qualified(Qualifiers.CONST),
+                Object(self.prog, self.point_type, {"x": 1, "y": 2}),
+            ),
+            Object(
+                self.prog, self.point_type.qualified(Qualifiers.CONST), {"x": 1, "y": 2}
+            ),
+        )
+
+    def test_struct_to_wrong_kind(self):
+        self.assertRaisesRegex(
+            TypeError,
+            "cannot convert.*to incompatible type",
+            implicit_convert,
+            self.option_type,
+            Object(self.prog, self.point_type, {"x": 1, "y": 2}),
+        )
+
+    def test_struct_to_different_type_with_same_name(self):
+        self.assertRaisesRegex(
+            TypeError,
+            "cannot convert.*to incompatible type",
+            implicit_convert,
+            self.prog.struct_type(
+                "point",
+                4,
+                (
+                    TypeMember(self.prog.int_type("short", 2, True), "x", 0),
+                    TypeMember(self.prog.int_type("short", 2, True), "y", 16),
+                ),
+            ),
+            Object(self.prog, self.point_type, {"x": 1, "y": 2}),
+        )
+
+    def test_union_to_self(self):
+        self.assertIdentical(
+            implicit_convert(
+                self.prog.union_type(
+                    "option",
+                    4,
+                    (
+                        TypeMember(self.prog.int_type("int", 4, True), "i"),
+                        TypeMember(self.prog.float_type("float", 4), "f"),
+                    ),
+                ),
+                Object(self.prog, self.option_type, {"i": 99}),
+            ),
+            Object(self.prog, self.option_type, {"i": 99}),
+        )
+        self.assertIdentical(
+            implicit_convert(
+                self.option_type.qualified(Qualifiers.CONST),
+                Object(self.prog, self.option_type, {"i": 99}),
+            ),
+            Object(self.prog, self.option_type.qualified(Qualifiers.CONST), {"i": 99}),
+        )
+
+    def test_pointer_to_self(self):
+        self.assertIdentical(
+            implicit_convert("int *", Object(self.prog, "int *", 0x4)),
+            Object(self.prog, "int *", 0x4),
+        )
+        self.assertIdentical(
+            implicit_convert("void *", Object(self.prog, "void *", 0x4)),
+            Object(self.prog, "void *", 0x4),
+        )
+
+    def test_pointer_to_typedef_of_self(self):
+        self.assertIdentical(
+            implicit_convert(
+                "int *",
+                Object(
+                    self.prog,
+                    self.prog.pointer_type(
+                        self.prog.typedef_type("INT", self.prog.type("int"))
+                    ),
+                    0x4,
+                ),
+            ),
+            Object(self.prog, "int *", 0x4),
+        )
+        self.assertIdentical(
+            implicit_convert(
+                self.prog.pointer_type(
+                    self.prog.typedef_type("INT", self.prog.type("int"))
+                ),
+                Object(self.prog, "int *", 0x4),
+            ),
+            Object(
+                self.prog,
+                self.prog.pointer_type(
+                    self.prog.typedef_type("INT", self.prog.type("int"))
+                ),
+                0x4,
+            ),
+        )
+
+    def test_pointer_qualifiers(self):
+        self.assertIdentical(
+            implicit_convert("const int *", Object(self.prog, "const int *", 0x4)),
+            Object(self.prog, "const int *", 0x4),
+        )
+        self.assertIdentical(
+            implicit_convert("const int *", Object(self.prog, "int *", 0x4)),
+            Object(self.prog, "const int *", 0x4),
+        )
+        self.assertIdentical(
+            implicit_convert(
+                "const volatile int *", Object(self.prog, "volatile int *", 0x4)
+            ),
+            Object(self.prog, "const volatile int *", 0x4),
+        )
+
+    def test_void_pointer_qualifiers(self):
+        self.assertIdentical(
+            implicit_convert("const void *", Object(self.prog, "const void *", 0x4)),
+            Object(self.prog, "const void *", 0x4),
+        )
+        self.assertIdentical(
+            implicit_convert("const void *", Object(self.prog, "void *", 0x4)),
+            Object(self.prog, "const void *", 0x4),
+        )
+        self.assertIdentical(
+            implicit_convert(
+                "const volatile void *", Object(self.prog, "volatile void *", 0x4)
+            ),
+            Object(self.prog, "const volatile void *", 0x4),
+        )
+
+    def test_pointer_missing_qualifiers(self):
+        self.assertRaisesRegex(
+            TypeError,
+            "cannot convert.*to incompatible type",
+            implicit_convert,
+            "int *",
+            Object(self.prog, "const int *", 0x4),
+        )
+        self.assertRaisesRegex(
+            TypeError,
+            "cannot convert.*to incompatible type",
+            implicit_convert,
+            "volatile int *",
+            Object(self.prog, "const int *", 0x4),
+        )
+        self.assertRaisesRegex(
+            TypeError,
+            "cannot convert.*to incompatible type",
+            implicit_convert,
+            "const int *",
+            Object(self.prog, "const volatile int *", 0x4),
+        )
+
+    def test_void_pointer_missing_qualifiers(self):
+        self.assertRaisesRegex(
+            TypeError,
+            "cannot convert.*to incompatible type",
+            implicit_convert,
+            "void *",
+            Object(self.prog, "const void *", 0x4),
+        )
+        self.assertRaisesRegex(
+            TypeError,
+            "cannot convert.*to incompatible type",
+            implicit_convert,
+            "volatile void *",
+            Object(self.prog, "const void *", 0x4),
+        )
+        self.assertRaisesRegex(
+            TypeError,
+            "cannot convert.*to incompatible type",
+            implicit_convert,
+            "const void *",
+            Object(self.prog, "const volatile void *", 0x4),
+        )
+
+    def test_pointer_to_pointer(self):
+        self.assertRaisesRegex(
+            TypeError,
+            "cannot convert.*to incompatible type",
+            implicit_convert,
+            "int **",
+            Object(self.prog, "void **", 0x4),
+        )
+        self.assertRaisesRegex(
+            TypeError,
+            "cannot convert.*to incompatible type",
+            implicit_convert,
+            "void **",
+            Object(self.prog, "int **", 0x4),
+        )
+
+    def test_pointer_to_pointer_qualifiers(self):
+        self.assertIdentical(
+            implicit_convert("void * const *", Object(self.prog, "void **", 0x4)),
+            Object(self.prog, "void * const *", 0x4),
+        )
+        self.assertRaisesRegex(
+            TypeError,
+            "cannot convert.*to incompatible type",
+            implicit_convert,
+            "const void **",
+            Object(self.prog, "void **", 0x4),
+        )
+
+    def test_to_void_pointer(self):
+        self.assertIdentical(
+            implicit_convert("void *", Object(self.prog, "int *", 0x4)),
+            Object(self.prog, "void *", 0x4),
+        )
+        self.assertIdentical(
+            implicit_convert("const void *", Object(self.prog, "int *", 0x4)),
+            Object(self.prog, "const void *", 0x4),
+        )
+
+    def test_from_void_pointer(self):
+        self.assertIdentical(
+            implicit_convert("int *", Object(self.prog, "void *", 0x4)),
+            Object(self.prog, "int *", 0x4),
+        )
+        self.assertIdentical(
+            implicit_convert("const int *", Object(self.prog, "void *", 0x4)),
+            Object(self.prog, "const int *", 0x4),
+        )
+
+    def test_pointer_to_different_int_types(self):
+        self.assertRaisesRegex(
+            TypeError,
+            "cannot convert.*to incompatible type",
+            implicit_convert,
+            "long *",
+            Object(self.prog, "long long *", 0x4),
+        )
+
+    def test_pointer_to_same_struct(self):
+        self.assertIdentical(
+            implicit_convert(
+                self.prog.pointer_type(self.point_type),
+                Object(self.prog, self.prog.pointer_type(self.point_type), 0x4),
+            ),
+            Object(self.prog, self.prog.pointer_type(self.point_type), 0x4),
+        )
+
+    def test_pointer_to_incomplete_struct(self):
+        self.assertIdentical(
+            implicit_convert(
+                self.prog.pointer_type(self.point_type),
+                Object(
+                    self.prog,
+                    self.prog.pointer_type(self.prog.struct_type("point")),
+                    0x4,
+                ),
+            ),
+            Object(self.prog, self.prog.pointer_type(self.point_type), 0x4),
+        )
+        self.assertIdentical(
+            implicit_convert(
+                self.prog.pointer_type(self.prog.struct_type("point")),
+                Object(self.prog, self.prog.pointer_type(self.point_type), 0x4),
+            ),
+            Object(
+                self.prog, self.prog.pointer_type(self.prog.struct_type("point")), 0x4
+            ),
+        )
+
+    def test_pointer_to_different_struct(self):
+        self.assertRaisesRegex(
+            TypeError,
+            "cannot convert.*to incompatible type",
+            implicit_convert,
+            self.prog.pointer_type(self.prog.struct_type("foo")),
+            Object(self.prog, self.prog.pointer_type(self.point_type), 0x4),
+        )
+
+    def test_pointer_to_enum_same(self):
+        self.assertIdentical(
+            implicit_convert(
+                self.prog.pointer_type(self.color_type),
+                Object(self.prog, self.prog.pointer_type(self.color_type), 0x4),
+            ),
+            Object(self.prog, self.prog.pointer_type(self.color_type), 0x4),
+        )
+
+    def test_pointer_to_enum_compatible_type(self):
+        self.assertIdentical(
+            implicit_convert(
+                "unsigned int *",
+                Object(self.prog, self.prog.pointer_type(self.color_type), 0x4),
+            ),
+            Object(self.prog, "unsigned int *", 0x4),
+        )
+        self.assertIdentical(
+            implicit_convert(
+                self.prog.pointer_type(self.color_type),
+                Object(self.prog, "unsigned int *", 0x4),
+            ),
+            Object(self.prog, self.prog.pointer_type(self.color_type), 0x4),
+        )
+
+    def test_pointer_to_incomplete_enum(self):
+        incomplete_type = self.prog.pointer_type(self.prog.enum_type("color"))
+        self.assertIdentical(
+            implicit_convert(
+                incomplete_type,
+                Object(self.prog, self.prog.pointer_type(self.color_type), 0x4),
+            ),
+            Object(self.prog, incomplete_type, 0x4),
+        )
+        self.assertIdentical(
+            implicit_convert(
+                self.prog.pointer_type(self.color_type),
+                Object(self.prog, incomplete_type, 0x4),
+            ),
+            Object(self.prog, self.prog.pointer_type(self.color_type), 0x4),
+        )
+
+    def test_pointer_to_different_enum_with_same_name(self):
+        other_type = self.prog.pointer_type(
+            self.prog.enum_type("color", self.prog.type("int"), ())
+        )
+        self.assertRaisesRegex(
+            TypeError,
+            "cannot convert.*to incompatible type",
+            implicit_convert,
+            other_type,
+            Object(self.prog, self.prog.pointer_type(self.color_type), 0x4),
+        )
+        self.assertRaisesRegex(
+            TypeError,
+            "cannot convert.*to incompatible type",
+            implicit_convert,
+            self.prog.pointer_type(self.color_type),
+            Object(self.prog, other_type, 0x4),
+        )
+
+    def test_pointer_to_different_enum_with_same_compatible_type(self):
+        other_type = self.prog.pointer_type(
+            self.prog.enum_type("foo", self.prog.type("unsigned int"), ())
+        )
+        self.assertRaisesRegex(
+            TypeError,
+            "cannot convert.*to incompatible type",
+            implicit_convert,
+            other_type,
+            Object(self.prog, self.prog.pointer_type(self.color_type), 0x4),
+        )
+        self.assertRaisesRegex(
+            TypeError,
+            "cannot convert.*to incompatible type",
+            implicit_convert,
+            self.prog.pointer_type(self.color_type),
+            Object(self.prog, other_type, 0x4),
+        )
+
+    def test_pointer_to_different_incomplete_enum(self):
+        other_type = self.prog.pointer_type(self.prog.enum_type("foo"))
+        self.assertRaisesRegex(
+            TypeError,
+            "cannot convert.*to incompatible type",
+            implicit_convert,
+            other_type,
+            Object(self.prog, self.prog.pointer_type(self.color_type), 0x4),
+        )
+        self.assertRaisesRegex(
+            TypeError,
+            "cannot convert.*to incompatible type",
+            implicit_convert,
+            self.prog.pointer_type(self.color_type),
+            Object(self.prog, other_type, 0x4),
+        )
+
+    def test_array_to_pointer(self):
+        self.assertIdentical(
+            implicit_convert("int *", Object(self.prog, "int [3]", address=0x8)),
+            Object(self.prog, "int *", 0x8),
+        )
+
+    def test_pointer_to_array(self):
+        self.assertIdentical(
+            implicit_convert("int (*)[3]", Object(self.prog, "int (*)[3]", 0x8)),
+            Object(self.prog, "int (*)[3]", 0x8),
+        )
+
+    def test_pointer_to_incomplete_array(self):
+        self.assertIdentical(
+            implicit_convert("int (*)[]", Object(self.prog, "int (*)[]", 0x8)),
+            Object(self.prog, "int (*)[]", 0x8),
+        )
+
+    def test_pointer_to_complete_and_incomplete_array(self):
+        self.assertIdentical(
+            implicit_convert("int (*)[3]", Object(self.prog, "int (*)[]", 0x8)),
+            Object(self.prog, "int (*)[3]", 0x8),
+        )
+        self.assertIdentical(
+            implicit_convert("int (*)[]", Object(self.prog, "int (*)[3]", 0x8)),
+            Object(self.prog, "int (*)[]", 0x8),
+        )
+
+    def test_pointer_to_array_with_different_length(self):
+        self.assertRaisesRegex(
+            TypeError,
+            "cannot convert.*to incompatible type",
+            implicit_convert,
+            "int (*)[4]",
+            Object(self.prog, "int (*)[3]", 0x8),
+        )
+
+    def test_pointer_to_array_with_different_element_type(self):
+        self.assertRaisesRegex(
+            TypeError,
+            "cannot convert.*to incompatible type",
+            implicit_convert,
+            "long (*)[3]",
+            Object(self.prog, "long long (*)[3]", 0x8),
+        )
+
+    def test_function_pointer_to_self(self):
+        self.assertIdentical(
+            implicit_convert(
+                self.prog.pointer_type(
+                    self.prog.function_type(
+                        self.prog.type("int"),
+                        (
+                            TypeParameter(self.prog.type("long")),
+                            TypeParameter(self.prog.type("void *")),
+                        ),
+                    )
+                ),
+                Object(
+                    self.prog,
+                    self.prog.pointer_type(
+                        self.prog.function_type(
+                            self.prog.type("int"),
+                            (
+                                # Note: parameter names don't matter.
+                                TypeParameter(self.prog.type("long"), "l"),
+                                TypeParameter(self.prog.type("void *"), "p"),
+                            ),
+                        )
+                    ),
+                    0x8,
+                ),
+            ),
+            Object(
+                self.prog,
+                self.prog.pointer_type(
+                    self.prog.function_type(
+                        self.prog.type("int"),
+                        (
+                            TypeParameter(self.prog.type("long")),
+                            TypeParameter(self.prog.type("void *")),
+                        ),
+                    )
+                ),
+                0x8,
+            ),
+        )
+
+    def test_variadic_function_pointer_to_self(self):
+        self.assertIdentical(
+            implicit_convert(
+                self.prog.pointer_type(
+                    self.prog.function_type(self.prog.type("int"), (), is_variadic=True)
+                ),
+                Object(
+                    self.prog,
+                    self.prog.pointer_type(
+                        self.prog.function_type(
+                            self.prog.type("int"), (), is_variadic=True
+                        )
+                    ),
+                    0x8,
+                ),
+            ),
+            Object(
+                self.prog,
+                self.prog.pointer_type(
+                    self.prog.function_type(self.prog.type("int"), (), is_variadic=True)
+                ),
+                0x8,
+            ),
+        )
+
+    def test_function_to_function_pointer(self):
+        self.assertIdentical(
+            implicit_convert(
+                self.prog.pointer_type(
+                    self.prog.function_type(
+                        self.prog.type("int"),
+                        (
+                            TypeParameter(self.prog.type("long")),
+                            TypeParameter(self.prog.type("void *")),
+                        ),
+                    )
+                ),
+                Object(
+                    self.prog,
+                    self.prog.function_type(
+                        self.prog.type("int"),
+                        (
+                            TypeParameter(self.prog.type("long"), "l"),
+                            TypeParameter(self.prog.type("void *"), "p"),
+                        ),
+                    ),
+                    address=0x8,
+                ),
+            ),
+            Object(
+                self.prog,
+                self.prog.pointer_type(
+                    self.prog.function_type(
+                        self.prog.type("int"),
+                        (
+                            TypeParameter(self.prog.type("long")),
+                            TypeParameter(self.prog.type("void *")),
+                        ),
+                    )
+                ),
+                0x8,
+            ),
+        )
+
+    def test_function_pointers_with_different_return_types(self):
+        type1 = self.prog.pointer_type(
+            self.prog.function_type(self.prog.type("long"), ())
+        )
+        type2 = self.prog.pointer_type(
+            self.prog.function_type(self.prog.type("long long"), ())
+        )
+        self.assertRaisesRegex(
+            TypeError,
+            "cannot convert.*to incompatible type",
+            implicit_convert,
+            type1,
+            Object(self.prog, type2, 0x8),
+        )
+        self.assertRaisesRegex(
+            TypeError,
+            "cannot convert.*to incompatible type",
+            implicit_convert,
+            type2,
+            Object(self.prog, type1, 0x8),
+        )
+
+    def test_function_pointers_with_different_number_of_parameters(
+        self,
+    ):
+        type1 = self.prog.pointer_type(
+            self.prog.function_type(self.prog.type("int"), ())
+        )
+        type2 = self.prog.pointer_type(
+            self.prog.function_type(
+                self.prog.type("int"), (TypeParameter(self.prog.type("int")),)
+            )
+        )
+        self.assertRaisesRegex(
+            TypeError,
+            "cannot convert.*to incompatible type",
+            implicit_convert,
+            type1,
+            Object(self.prog, type2, 0x8),
+        )
+        self.assertRaisesRegex(
+            TypeError,
+            "cannot convert.*to incompatible type",
+            implicit_convert,
+            type2,
+            Object(self.prog, type1, 0x8),
+        )
+
+    def test_function_pointers_with_incompatible_parameter_types(self):
+        type1 = self.prog.pointer_type(
+            self.prog.function_type(
+                self.prog.type("int"), (TypeParameter(self.prog.type("long")),)
+            )
+        )
+        type2 = self.prog.pointer_type(
+            self.prog.function_type(
+                self.prog.type("int"), (TypeParameter(self.prog.type("long long")),)
+            )
+        )
+        self.assertRaisesRegex(
+            TypeError,
+            "cannot convert.*to incompatible type",
+            implicit_convert,
+            type1,
+            Object(self.prog, type2, 0x8),
+        )
+        self.assertRaisesRegex(
+            TypeError,
+            "cannot convert.*to incompatible type",
+            implicit_convert,
+            type2,
+            Object(self.prog, type1, 0x8),
+        )
+
+    def test_function_pointers_with_different_is_variadic(self):
+        type1 = self.prog.pointer_type(
+            self.prog.function_type(self.prog.type("int"), (), is_variadic=False)
+        )
+        type2 = self.prog.pointer_type(
+            self.prog.function_type(self.prog.type("int"), (), is_variadic=True)
+        )
+        self.assertRaisesRegex(
+            TypeError,
+            "cannot convert.*to incompatible type",
+            implicit_convert,
+            type1,
+            Object(self.prog, type2, 0x8),
+        )
+        self.assertRaisesRegex(
+            TypeError,
+            "cannot convert.*to incompatible type",
+            implicit_convert,
+            type2,
+            Object(self.prog, type1, 0x8),
+        )
+
+    def test_pointer_to_int(self):
+        self.assertRaisesRegex(
+            TypeError,
+            "cannot convert.*to incompatible type",
+            implicit_convert,
+            "int",
+            Object(self.prog, "void *", 0),
+        )
+
+    def test_to_void(self):
+        self.assertRaisesRegex(
+            TypeError,
+            "cannot convert to",
+            implicit_convert,
+            "void",
+            Object(self.prog, "void"),
+        )
+
+    def test_to_array(self):
+        self.assertRaisesRegex(
+            TypeError,
+            "cannot convert to",
+            implicit_convert,
+            "int [3]",
+            Object(self.prog, "int [3]", address=0x8),
+        )
+
+    def test_to_function(self):
+        self.assertRaisesRegex(
+            TypeError,
+            "cannot convert to",
+            implicit_convert,
+            self.prog.function_type(self.prog.type("int"), ()),
+            Object(
+                self.prog,
+                self.prog.function_type(self.prog.type("int"), ()),
+                address=0x8,
+            ),
+        )
 
 
 class TestPrettyPrintObject(MockProgramTestCase):
@@ -2388,9 +3038,8 @@ class TestPrettyPrintObject(MockProgramTestCase):
         self.assertEqual(str(obj), "(void (void))0xffff0000")
 
     def test_absent(self):
-        self.assertRaises(TypeError, str, Object(self.prog, "void"))
-
         for type_ in [
+            "void",
             "int",
             "char",
             "_Bool",

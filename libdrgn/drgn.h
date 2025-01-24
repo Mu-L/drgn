@@ -16,7 +16,6 @@
 #include <stdint.h>
 // IWYU pragma: end_exports
 
-#include <assert.h>
 #include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -29,7 +28,7 @@
  * libdrgn provides the functionality of the
  * [drgn](https://github.com/osandov/drgn) programmable debugger as a library.
  * It implements the main drgn abstractions: @ref Programs, @ref Types, @ref
- * Objects, and @ref StackTraces. See [Modules](modules.html) for detailed
+ * Objects, and @ref StackTraces. See [Topics](topics.html) for detailed
  * documentation.
  *
  * @subsection ThreadSafety Thread Safety
@@ -45,7 +44,7 @@
 /** Minor version of drgn. */
 #define DRGN_VERSION_MINOR 0
 /** Patch level of drgn. */
-#define DRGN_VERSION_PATCH 25
+#define DRGN_VERSION_PATCH 30
 
 /**
  * @defgroup ErrorHandling Error handling
@@ -370,11 +369,25 @@ struct drgn_qualified_type {
 	enum drgn_qualifiers qualifiers;
 };
 
-static inline struct drgn_program *
-drgn_type_program(struct drgn_type *type);
+#ifndef DRGN_ACCESSOR_LINKAGE
+#define DRGN_ACCESSOR_LINKAGE extern
+#endif
 
-static inline const struct drgn_language *
-drgn_type_language(struct drgn_type *type);
+/**
+ * @ingroup Types
+ *
+ * Get the program that a @ref drgn_type is from.
+ */
+DRGN_ACCESSOR_LINKAGE
+struct drgn_program *drgn_type_program(struct drgn_type *type);
+
+/**
+ * @ingroup Types
+ *
+ * Get the language of a type.
+ */
+DRGN_ACCESSOR_LINKAGE
+const struct drgn_language *drgn_type_language(struct drgn_type *type);
 
 /**
  * @defgroup Platforms Platforms
@@ -580,41 +593,98 @@ drgn_program_add_memory_segment(struct drgn_program *prog, uint64_t address,
  */
 bool drgn_filename_matches(const char *haystack, const char *needle);
 
-/**
- * Callback for finding a type.
- *
- * @param[in] kinds Kinds of types to find, as a bitmask of bits shifted by @ref
- * drgn_type_kind. E.g., `(1 << DRGN_TYPE_STRUCT) | (1 << DRGN_TYPE_CLASS)`
- * means to find a structure or class type.
- * @param[in] name Name of type (or tag, for structs, unions, and enums). This
- * is @em not null-terminated.
- * @param[in] name_len Length of @p name.
- * @param[in] filename Filename containing the type definition or @c NULL. This
- * should be matched with @ref drgn_filename_matches().
- * @param[in] arg Argument passed to @ref drgn_program_add_type_finder().
- * @param[out] ret Returned type.
- * @return @c NULL on success, non-@c NULL on error. In particular, if the type
- * is not found, this should return &@ref drgn_not_found; any other errors are
- * considered fatal.
- */
-typedef struct drgn_error *
-(*drgn_type_find_fn)(uint64_t kinds, const char *name, size_t name_len,
-		     const char *filename, void *arg,
-		     struct drgn_qualified_type *ret);
+enum {
+	/** Enable a handler after all enabled handlers. */
+	DRGN_HANDLER_REGISTER_ENABLE_LAST = SIZE_MAX,
+	/** Don't enable a handler. */
+	DRGN_HANDLER_REGISTER_DONT_ENABLE = SIZE_MAX - 1,
+};
+
+/** Type finder callback table. */
+struct drgn_type_finder_ops {
+	/**
+	 * Callback to destroy the type finder.
+	 *
+	 * This may be @c NULL.
+	 *
+	 * @param[in] arg Argument passed to @ref
+	 * drgn_program_register_type_finder().
+	 */
+	void (*destroy)(void *arg);
+	/**
+	 * Callback for finding a type.
+	 *
+	 * @param[in] kinds Kinds of types to find, as a bitmask of bits shifted
+	 * by @ref drgn_type_kind. E.g., `(1 << DRGN_TYPE_STRUCT) | (1 <<
+	 * DRGN_TYPE_CLASS)` means to find a structure or class type.
+	 * @param[in] name Name of type (or tag, for structs, unions, and
+	 * enums). This is @em not null-terminated.
+	 * @param[in] name_len Length of @p name.
+	 * @param[in] filename Filename containing the type definition or @c
+	 * NULL. This should be matched with @ref drgn_filename_matches().
+	 * @param[in] arg Argument passed to @ref
+	 * drgn_program_register_type_finder().
+	 * @param[out] ret Returned type.
+	 * @return @c NULL on success, non-@c NULL on error. In particular, if
+	 * the type is not found, this should return &@ref drgn_not_found; any
+	 * other errors are considered fatal.
+	 */
+	struct drgn_error *(*find)(uint64_t kinds, const char *name,
+				   size_t name_len, const char *filename,
+				   void *arg, struct drgn_qualified_type *ret);
+};
 
 /**
  * Register a type finding callback.
  *
- * Callbacks are called in reverse order of the order they were added until the
- * type is found. So, more recently added callbacks take precedence.
- *
- * @param[in] fn The callback.
- * @param[in] arg Argument to pass to @p fn.
- * @return @c NULL on success, non-@c NULL on error.
+ * @param[in] name Finder name. This is copied.
+ * @param[in] ops Callback table. This is copied.
+ * @param[in] arg Argument to pass to callbacks.
+ * @param[in] enable_index Insert the finder into the list of enabled finders at
+ * the given index. If @ref DRGN_HANDLER_REGISTER_ENABLE_LAST or greater than
+ * the number of enabled finders, insert it at the end. If @ref
+ * DRGN_HANDLER_REGISTER_DONT_ENABLE, don’t enable the finder.
  */
 struct drgn_error *
-drgn_program_add_type_finder(struct drgn_program *prog, drgn_type_find_fn fn,
-			     void *arg);
+drgn_program_register_type_finder(struct drgn_program *prog, const char *name,
+				  const struct drgn_type_finder_ops *ops,
+				  void *arg, size_t enable_index);
+
+/**
+ * Get the names of all registered type finders.
+ *
+ * The order of the names is arbitrary.
+ *
+ * @param[out] names_ret Returned array of names.
+ * @param[out] count_ret Returned number of names in @p names_ret.
+ */
+struct drgn_error *
+drgn_program_registered_type_finders(struct drgn_program *prog,
+				     const char ***names_ret,
+				     size_t *count_ret);
+
+/**
+ * Set the list of enabled type finders.
+ *
+ * Finders are called in the same order as the list until a type is found.
+ *
+ * @param[in] names Names of finders to enable, in order.
+ * @param[in] count Number of names in @p names.
+ */
+struct drgn_error *
+drgn_program_set_enabled_type_finders(struct drgn_program *prog,
+				      const char * const *names,
+				      size_t count);
+
+/**
+ * Get the names of enabled type finders, in order.
+ *
+ * @param[out] names_ret Returned array of names.
+ * @param[out] count_ret Returned number of names in @p names_ret.
+ */
+struct drgn_error *drgn_program_enabled_type_finders(struct drgn_program *prog,
+						     const char ***names_ret,
+						     size_t *count_ret);
 
 /** Flags for @ref drgn_program_find_object(). */
 enum drgn_find_object_flags {
@@ -628,38 +698,90 @@ enum drgn_find_object_flags {
 	DRGN_FIND_OBJECT_ANY = (1 << 3) - 1,
 };
 
-/**
- * Callback for finding an object.
- *
- * @param[in] name Name of object. This is @em not null-terminated.
- * @param[in] name_len Length of @p name.
- * @param[in] filename Filename containing the object definition or @c NULL.
- * This should be matched with @ref drgn_filename_matches().
- * @param[in] flags Flags indicating what kind of object to look for.
- * @param[in] arg Argument passed to @ref drgn_program_add_object_finder().
- * @param[out] ret Returned object. This must only be modified on success.
- * @return @c NULL on success, non-@c NULL on error. In particular, if the
- * object is not found, this should return &@ref drgn_not_found; any other
- * errors are considered fatal.
- */
-typedef struct drgn_error *
-(*drgn_object_find_fn)(const char *name, size_t name_len, const char *filename,
-		       enum drgn_find_object_flags flags, void *arg,
-		       struct drgn_object *ret);
+/** Object finder callback table. */
+struct drgn_object_finder_ops {
+	/**
+	 * Callback to destroy the object finder.
+	 *
+	 * This may be @c NULL.
+	 *
+	 * @param[in] arg Argument passed to @ref
+	 * drgn_program_register_object_finder().
+	 */
+	void (*destroy)(void *arg);
+	/**
+	 * Callback for finding an object.
+	 *
+	 * @param[in] name Name of object. This is @em not null-terminated.
+	 * @param[in] name_len Length of @p name.
+	 * @param[in] filename Filename containing the object definition or @c
+	 * NULL. This should be matched with @ref drgn_filename_matches().
+	 * @param[in] flags Flags indicating what kind of object to look for.
+	 * @param[in] arg Argument passed to @ref
+	 * drgn_program_register_object_finder().
+	 * @param[out] ret Returned object. This must only be modified on
+	 * success.
+	 * @return @c NULL on success, non-@c NULL on error. In particular, if
+	 * the object is not found, this should return &@ref drgn_not_found; any
+	 * other errors are considered fatal.
+	 */
+	struct drgn_error *(*find)(const char *name, size_t name_len,
+				   const char *filename,
+				   enum drgn_find_object_flags flags,
+				   void *arg, struct drgn_object *ret);
+};
 
 /**
- * Register a object finding callback.
+ * Register an object finding callback.
  *
- * Callbacks are called in reverse order of the order they were added until the
- * object is found. So, more recently added callbacks take precedence.
- *
- * @param[in] fn The callback.
- * @param[in] arg Argument to pass to @p fn.
- * @return @c NULL on success, non-@c NULL on error.
+ * @param[in] name Finder name. This is copied.
+ * @param[in] ops Callback table. This is copied.
+ * @param[in] arg Argument to pass to callbacks.
+ * @param[in] enable_index Insert the finder into the list of enabled finders at
+ * the given index. If @ref DRGN_HANDLER_REGISTER_ENABLE_LAST or greater than
+ * the number of enabled finders, insert it at the end. If @ref
+ * DRGN_HANDLER_REGISTER_DONT_ENABLE, don’t enable the finder.
  */
 struct drgn_error *
-drgn_program_add_object_finder(struct drgn_program *prog,
-			       drgn_object_find_fn fn, void *arg);
+drgn_program_register_object_finder(struct drgn_program *prog, const char *name,
+				    const struct drgn_object_finder_ops *ops,
+				    void *arg, size_t enable_index);
+
+/**
+ * Get the names of all registered object finders.
+ *
+ * The order of the names is arbitrary.
+ *
+ * @param[out] names_ret Returned array of names.
+ * @param[out] count_ret Returned number of names in @p names_ret.
+ */
+struct drgn_error *
+drgn_program_registered_object_finders(struct drgn_program *prog,
+				       const char ***names_ret,
+				       size_t *count_ret);
+
+/**
+ * Set the list of enabled object finders.
+ *
+ * Finders are called in the same order as the list until a object is found.
+ *
+ * @param[in] names Names of finders to enable, in order.
+ * @param[in] count Number of names in @p names.
+ */
+struct drgn_error *
+drgn_program_set_enabled_object_finders(struct drgn_program *prog,
+					const char * const *names,
+					size_t count);
+
+/**
+ * Get the names of enabled object finders, in order.
+ *
+ * @param[out] names_ret Returned array of names.
+ * @param[out] count_ret Returned number of names in @p names_ret.
+ */
+struct drgn_error *
+drgn_program_enabled_object_finders(struct drgn_program *prog,
+				    const char ***names_ret, size_t *count_ret);
 
 /**
  * Set a @ref drgn_program to a core dump.
@@ -696,19 +818,6 @@ struct drgn_error *drgn_program_set_kernel(struct drgn_program *prog);
  * @return @c NULL on success, non-@c NULL on error.
  */
 struct drgn_error *drgn_program_set_pid(struct drgn_program *prog, pid_t pid);
-
-/**
- * Load debugging information for a list of executable or library files.
- *
- * @param[in] load_default Whether to also load debugging information which can
- * automatically be determined from the program. This implies @p load_main.
- * @param[in] load_main Whether to also load information for the main
- * executable.
- */
-struct drgn_error *drgn_program_load_debug_info(struct drgn_program *prog,
-						const char **paths, size_t n,
-						bool load_default,
-						bool load_main);
 
 /**
  * Create a @ref drgn_program from a core dump file.
@@ -930,6 +1039,126 @@ struct drgn_error *drgn_program_find_symbols_by_address(struct drgn_program *pro
 							struct drgn_symbol ***syms_ret,
 							size_t *count_ret);
 
+/** Flags for @ref drgn_symbol_finder_ops::find() */
+enum drgn_find_symbol_flags {
+	/** Find symbols whose name matches the name argument */
+	DRGN_FIND_SYMBOL_NAME = 1 << 0,
+	/** Find symbols whose address matches the addr argument */
+	DRGN_FIND_SYMBOL_ADDR = 1 << 1,
+	/** Find only one symbol */
+	DRGN_FIND_SYMBOL_ONE = 1 << 2,
+};
+
+/** Result builder for @ref drgn_symbol_finder_ops::find() */
+struct drgn_symbol_result_builder;
+
+/**
+ * Add or set the return value for a symbol search
+ *
+ * Symbol finders should call this with each symbol search result. If the symbol
+ * search was @ref DRGN_FIND_SYMBOL_ONE, then only the most recent symbol added
+ * to the builder will be returned. Otherwise, all symbols added to the builder
+ * are returned. Returns true on success, or false on an allocation failure.
+ */
+bool
+drgn_symbol_result_builder_add(struct drgn_symbol_result_builder *builder,
+			       struct drgn_symbol *symbol);
+
+/** Get the current number of results in a symbol search result. */
+size_t drgn_symbol_result_builder_count(const struct drgn_symbol_result_builder *builder);
+
+/** Symbol finder callback table. */
+struct drgn_symbol_finder_ops {
+	/**
+	 * Callback to destroy the symbol finder.
+	 *
+	 * This may be @c NULL.
+	 *
+	 * @param[in] arg Argument passed to @ref
+	 * drgn_program_register_symbol_finder().
+	 */
+	void (*destroy)(void *arg);
+	/**
+	 * Callback for finding one or more symbols.
+	 *
+	 * The callback should perform a symbol lookup based on the flags given
+	 * in @p flags. When multiple flags are provided, the effect should be
+	 * treated as a logical AND. Symbol results should be added to the
+	 * result builder @p builder, via @ref drgn_symbol_result_builder_add().
+	 * When @ref DRGN_FIND_SYMBOL_ONE is set, then the finding function
+	 * should only return the single best symbol result, and short-circuit
+	 * return.
+	 *
+	 * When no symbol is found, simply do not add any result to the builder.
+	 * No error should be returned in this case.
+	 *
+	 * @param[in] name Name of the symbol to match
+	 * @param[in] addr Address of the symbol to match
+	 * @param[in] flags Flags indicating the desired behavior of the search
+	 * @param[in] arg Argument passed to @ref
+	 * drgn_program_register_symbol_finder().
+	 * @param[in] builder Used to build the resulting symbol output
+	 */
+	struct drgn_error *(*find)(const char *name, uint64_t addr,
+				   enum drgn_find_symbol_flags flags, void *arg,
+				   struct drgn_symbol_result_builder *builder);
+};
+
+/**
+ * Register a symbol finding callback.
+ *
+ * @param[in] name Finder name. This is copied.
+ * @param[in] ops Callback table. This is copied.
+ * @param[in] arg Argument to pass to callbacks.
+ * @param[in] enable_index Insert the finder into the list of enabled finders at
+ * the given index. If @ref DRGN_HANDLER_REGISTER_ENABLE_LAST or greater than
+ * the number of enabled finders, insert it at the end. If @ref
+ * DRGN_HANDLER_REGISTER_DONT_ENABLE, don’t enable the finder.
+ */
+struct drgn_error *
+drgn_program_register_symbol_finder(struct drgn_program *prog, const char *name,
+				    const struct drgn_symbol_finder_ops *ops,
+				    void *arg, size_t enable_index);
+
+/**
+ * Get the names of all registered symbol finders.
+ *
+ * The order of the names is arbitrary.
+ *
+ * @param[out] names_ret Returned array of names.
+ * @param[out] count_ret Returned number of names in @p names_ret.
+ */
+struct drgn_error *
+drgn_program_registered_symbol_finders(struct drgn_program *prog,
+				       const char ***names_ret,
+				       size_t *count_ret);
+
+/**
+ * Set the list of enabled symbol finders.
+ *
+ * Finders are called in the same order as the list. In case of a search for
+ * multiple symbols, then the results of all callbacks are concatenated. If the
+ * search is for a single symbol, then the first callback which finds a symbol
+ * will short-circuit the search.
+ *
+ * @param[in] names Names of finders to enable, in order.
+ * @param[in] count Number of names in @p names.
+ */
+struct drgn_error *
+drgn_program_set_enabled_symbol_finders(struct drgn_program *prog,
+					const char * const *names,
+					size_t count);
+
+/**
+ * Get the names of enabled symbol finders, in order.
+ *
+ * @param[out] names_ret Returned array of names.
+ * @param[out] count_ret Returned number of names in @p names_ret.
+ */
+struct drgn_error *
+drgn_program_enabled_symbol_finders(struct drgn_program *prog,
+				    const char ***names_ret, size_t *count_ret);
+
 /** Element type and size. */
 struct drgn_element_info {
 	/** Type of the element. */
@@ -958,6 +1187,546 @@ struct drgn_error *drgn_program_element_info(struct drgn_program *prog,
 /** @} */
 
 /**
+ * @defgroup Modules Modules
+ *
+ * Modules in a program and debugging information.
+ *
+ * @{
+ */
+
+/** An executable, library, or other binary file used by a program. */
+struct drgn_module;
+
+/** Kinds of modules. */
+enum drgn_module_kind {
+	/**
+	 * Main module. For userspace programs, this is the executable. For the
+	 * Linux kernel, this is `vmlinux`.
+	 */
+	DRGN_MODULE_MAIN,
+	/** Shared library (a.k.a. dynamic library or dynamic shared object). */
+	DRGN_MODULE_SHARED_LIBRARY,
+	/** Virtual dynamic shared object (vDSO). */
+	DRGN_MODULE_VDSO,
+	/** Relocatable object (e.g., Linux kernel loadable module). */
+	DRGN_MODULE_RELOCATABLE,
+	/** Extra debugging information. */
+	DRGN_MODULE_EXTRA,
+} __attribute__((__packed__));
+
+/** Unique key for a @ref drgn_module. */
+struct drgn_module_key {
+	/** Kind of module. */
+	enum drgn_module_kind kind;
+	/** Kind-specific key. */
+	union {
+		struct {
+			/** Name of module. */
+			const char *name;
+			/** Address of dynamic section. */
+			uint64_t dynamic_address;
+		} shared_library;
+		struct {
+			/** Name of module. */
+			const char *name;
+			/** Address of dynamic section. */
+			uint64_t dynamic_address;
+		} vdso;
+		struct {
+			/** Name of module. */
+			const char *name;
+			/**
+			 * Address identifying the module (e.g., for Linux
+			 * kernel loadable modules, the base address).
+			 */
+			uint64_t address;
+		} relocatable;
+		struct {
+			/** Name of module. */
+			const char *name;
+			/** Arbitrary identification number. */
+			uint64_t id;
+		} extra;
+	};
+};
+
+/**
+ * Find the created @ref drgn_module matching the given @p key.
+ *
+ * @return Module, or @c NULL if not found.
+ */
+struct drgn_module *drgn_module_find(struct drgn_program *prog,
+				     const struct drgn_module_key *key);
+
+/**
+ * Find the created @ref drgn_module containing the given @p address.
+ *
+ * @return Module, or @c NULL if not found.
+ */
+struct drgn_module *drgn_module_find_by_address(struct drgn_program *prog,
+						uint64_t address);
+
+/**
+ * Find the main module, creating it if it doesn't already exist.
+ *
+ * @param[out] new_ret @c true if the module was newly created, @c false if it
+ * was found.
+ */
+struct drgn_error *drgn_module_find_or_create_main(struct drgn_program *prog,
+						   const char *name,
+						   struct drgn_module **ret,
+						   bool *new_ret);
+
+/**
+ * Find a shared library module, creating it if it doesn't already exist.
+ *
+ * @param[out] new_ret @c true if the module was newly created, @c false if it
+ * was found.
+ */
+struct drgn_error *
+drgn_module_find_or_create_shared_library(struct drgn_program *prog,
+					  const char *name,
+					  uint64_t dynamic_address,
+					  struct drgn_module **ret,
+					  bool *new_ret);
+
+/**
+ * Find a vDSO module, creating it if it doesn't already exist.
+ *
+ * @param[out] new_ret @c true if the module was newly created, @c false if it
+ * was found.
+ */
+struct drgn_error *drgn_module_find_or_create_vdso(struct drgn_program *prog,
+						   const char *name,
+						   uint64_t dynamic_address,
+						   struct drgn_module **ret,
+						   bool *new_ret);
+
+/**
+ * Find a relocatable module, creating it if it doesn't already exist.
+ *
+ * @param[out] new_ret @c true if the module was newly created, @c false if it
+ * was found.
+ */
+struct drgn_error *
+drgn_module_find_or_create_relocatable(struct drgn_program *prog,
+				       const char *name, uint64_t address,
+				       struct drgn_module **ret, bool *new_ret);
+
+/**
+ * Find a created Linux kernel loadable module from a ``struct module`` object.
+ *
+ * @param[out] new_ret @c true if the module was newly created, @c false if it
+ * was found.
+ */
+struct drgn_error *
+drgn_module_find_linux_kernel_loadable(const struct drgn_object *module_obj,
+				       struct drgn_module **ret);
+
+/**
+ * Find a Linux kernel loadable module from a ``struct module`` object, creating
+ * it if it doesn't already exist.
+ *
+ * @param[out] new_ret @c true if the module was newly created, @c false if it
+ * was found.
+ */
+struct drgn_error *
+drgn_module_find_or_create_linux_kernel_loadable(const struct drgn_object *module_obj,
+						 struct drgn_module **ret,
+						 bool *new_ret);
+
+/**
+ * Find an extra module, creating it if it doesn't already exist.
+ *
+ * @param[out] new_ret @c true if the module was newly created, @c false if it
+ * was found.
+ */
+struct drgn_error *drgn_module_find_or_create_extra(struct drgn_program *prog,
+						    const char *name,
+						    uint64_t id,
+						    struct drgn_module **ret,
+						    bool *new_ret);
+
+/** Get the program that a module is from. */
+struct drgn_program *drgn_module_program(const struct drgn_module *module);
+
+/** Get the unique key for a module. */
+struct drgn_module_key drgn_module_key(const struct drgn_module *module);
+
+/** Get the kind of a module. */
+enum drgn_module_kind drgn_module_kind(const struct drgn_module *module);
+
+/** Get the name of a module. */
+const char *drgn_module_name(const struct drgn_module *module);
+
+/**
+ * Get the address range where a module is loaded.
+ *
+ * If the module is not loaded in memory, then the start and end are both 0
+ *
+ * @param[out] start_ret Minimum address (inclusive).
+ * @param[out] end_ret Maximum address (exclusive).
+ * @return @c true on success, @c false if the address range is not known yet.
+ */
+bool drgn_module_address_range(const struct drgn_module *module,
+			       uint64_t *start_ret, uint64_t *end_ret);
+
+/**
+ * Set the address range of a module.
+ *
+ * @p start and @p end may both be 0 to indicate that the module is not loaded
+ * in memory. They may both be @c UINT64_MAX to unset the range. Otherwise, @p
+ * start must be less than @p end.
+ */
+struct drgn_error *drgn_module_set_address_range(struct drgn_module *module,
+						 uint64_t start, uint64_t end);
+
+/**
+ * Get the unique byte string (e.g., GNU build ID) identifying files used by
+ * a module.
+ *
+ * @param[out] raw_ret Returned raw build ID. @c NULL if not known. Valid until
+ * the build ID is changed.
+ * @param[out] raw_len_ret Size of returned build ID, in bytes. 0 if not known.
+ * @return Lowercase hexadecimal representation of build ID. @c NULL if not
+ * known. Valid until the build ID is changed.
+ */
+const char *drgn_module_build_id(const struct drgn_module *module,
+				 const void **raw_ret, size_t *raw_len_ret);
+
+/**
+ * Set the unique byte string (e.g., GNU build ID) identifying files used by a
+ * module.
+ *
+ * @param[in] build_id New build ID.
+ * @param[in] build_id_len New size of build ID, in bytes. May be 0 to unset the
+ * build ID.
+ */
+struct drgn_error *drgn_module_set_build_id(struct drgn_module *module,
+					    const void *build_id,
+					    size_t build_id_len);
+
+/** Get the address of a section with the given name in a relocatable module. */
+struct drgn_error *drgn_module_get_section_address(struct drgn_module *module,
+						   const char *name,
+						   uint64_t *ret);
+
+/**
+ * Set the address of a section with the given name in a relocatable module.
+ *
+ * This is not allowed after a file has been assigned to the module.
+ */
+struct drgn_error *drgn_module_set_section_address(struct drgn_module *module,
+						   const char *name,
+						   uint64_t address);
+
+/**
+ * Unset the address of a section with the given name in a relocatable module.
+ *
+ * This is not allowed after a file has been assigned to the module.
+ */
+struct drgn_error *drgn_module_delete_section_address(struct drgn_module *module,
+						      const char *name);
+
+/**
+ * Get the number of section addresses currently set in a relocatable module.
+ */
+struct drgn_error *drgn_module_num_section_addresses(struct drgn_module *module,
+						     size_t *ret);
+
+/** Iterator over set section addresses in a relocatable module. */
+struct drgn_module_section_address_iterator;
+
+/** Create a @ref drgn_module_section_address_iterator. */
+struct drgn_error *
+drgn_module_section_address_iterator_create(struct drgn_module *module,
+					    struct drgn_module_section_address_iterator **ret);
+
+/** Destroy a @ref drgn_module_section_address_iterator. */
+void
+drgn_module_section_address_iterator_destroy(struct drgn_module_section_address_iterator *it);
+
+/** Get the module that a @ref drgn_module_section_address_iterator is for. */
+struct drgn_module *
+drgn_module_section_address_iterator_module(struct drgn_module_section_address_iterator *it);
+
+/**
+ * Get the next section name and address from a @ref
+ * drgn_module_section_address_iterator.
+ *
+ * @param[out] name_ret Returned name. Valid until the the next call to @ref
+ * drgn_module_section_address_iterator_next() or @ref
+ * drgn_module_section_address_iterator_destroy() on @it.
+ * @param[out] address_ret Returned address.
+ */
+struct drgn_error *
+drgn_module_section_address_iterator_next(struct drgn_module_section_address_iterator *it,
+					  const char **name_ret,
+					  uint64_t *address_ret);
+
+/** Status of a file in a @ref drgn_module. */
+enum drgn_module_file_status {
+	/** File has not been found and should be searched for. */
+	DRGN_MODULE_FILE_WANT,
+	/** File has already been found and assigned. */
+	DRGN_MODULE_FILE_HAVE,
+	/** File has not been found, but it should not be searched for. */
+	DRGN_MODULE_FILE_DONT_WANT,
+	/** File has not been found and is not needed. */
+	DRGN_MODULE_FILE_DONT_NEED,
+	/**
+	 * File has been found, but it requires a supplementary file before it
+	 * can be used.
+	 */
+	DRGN_MODULE_FILE_WANT_SUPPLEMENTARY,
+};
+
+/** Kind of supplementary file. */
+enum drgn_supplementary_file_kind {
+	/** Not known or not needed. */
+	DRGN_SUPPLEMENTARY_FILE_NONE,
+	/**
+	 * GNU-style supplementary debug file referred to by a
+	 * ``.gnu_debugaltlink`` section.
+	 */
+	DRGN_SUPPLEMENTARY_FILE_GNU_DEBUGALTLINK,
+};
+
+/** Get the status of a module's loaded file. */
+enum drgn_module_file_status
+drgn_module_loaded_file_status(const struct drgn_module *module);
+
+/** Set the status of a module's loaded file. */
+bool drgn_module_set_loaded_file_status(struct drgn_module *module,
+					enum drgn_module_file_status status);
+
+/**
+ * Get whether a module wants a loaded file.
+ *
+ * For future-proofness, debug info finders should prefer this over comparing
+ * @ref drgn_module_loaded_file_status() directly.
+ */
+bool drgn_module_wants_loaded_file(const struct drgn_module *module);
+
+/** Get the absolute path of a module's loaded file, or @c NULL if not known. */
+const char *drgn_module_loaded_file_path(const struct drgn_module *module);
+
+/**
+ * Get the difference between the load address in the program and addresses in a
+ * module's loaded file.
+ */
+uint64_t drgn_module_loaded_file_bias(const struct drgn_module *module);
+
+enum drgn_module_file_status
+drgn_module_debug_file_status(const struct drgn_module *module);
+
+bool drgn_module_set_debug_file_status(struct drgn_module *module,
+				       enum drgn_module_file_status status);
+
+/**
+ * Get whether a module wants a debug file.
+ *
+ * For future-proofness, debug info finders should prefer this over comparing
+ * @ref drgn_module_debug_file_status() directly.
+ */
+bool drgn_module_wants_debug_file(const struct drgn_module *module);
+
+/** Get the absolute path of a module's debug file, or @c NULL if not known. */
+const char *drgn_module_debug_file_path(const struct drgn_module *module);
+
+/**
+ * Get the difference between the load address in the program and addresses in a
+ * module's debug file.
+ */
+uint64_t drgn_module_debug_file_bias(const struct drgn_module *module);
+
+/** Get the kind of a module's supplementary debug file. */
+enum drgn_supplementary_file_kind
+drgn_module_supplementary_debug_file_kind(const struct drgn_module *module);
+
+/**
+ * Get the absolute path of a module's supplementary debug file, or @c NULL if
+ * not known or not needed.
+ */
+const char *
+drgn_module_supplementary_debug_file_path(const struct drgn_module *module);
+
+/**
+ * Get information about the supplementary debug file that a module currently
+ * wants.
+ *
+ * @param[out] debug_file_path_ret Path of main file that wants the
+ * supplementary file.
+ * @param[out] supplementary_path_ret Path to supplementary file. This may be
+ * absolute or relative to @p debug_file_path_ret.
+ * @param[out] checksum_ret Unique identifier of the supplementary file.
+ * @param[out] checksum_len_ret Size of unique identifier, in bytes.
+ * @return Kind of supplementary file.
+ */
+enum drgn_supplementary_file_kind
+drgn_module_wanted_supplementary_debug_file(struct drgn_module *module,
+					    const char **debug_file_path_ret,
+					    const char **supplementary_path_ret,
+					    const void **checksum_ret,
+					    size_t *checksum_len_ret);
+
+/** Debugging information finder callback table. */
+struct drgn_debug_info_finder_ops {
+	/**
+	 * Callback to destroy the debug info finder.
+	 *
+	 * This may be @c NULL.
+	 *
+	 * @param[in] arg Argument passed to @ref
+	 * drgn_program_register_debug_info_finder().
+	 */
+	void (*destroy)(void *arg);
+	/**
+	 * Callback for finding debug info.
+	 *
+	 * @param[in] modules Array of modules that want debugging information.
+	 * @param[in] num_modules Number of modules in @p modules.
+	 * @param[in] arg Argument passed to @ref
+	 * drgn_program_register_debug_info_finder().
+	 * @return @c NULL on success, non-@c NULL on error. It is not an error
+	 * for some debugging information to not be found.
+	 */
+	struct drgn_error *(*find)(struct drgn_module * const *modules,
+				   size_t num_modules, void *arg);
+};
+
+/**
+ * Register a debugging information finding callback.
+ *
+ * @param[in] name Finder name. This is copied.
+ * @param[in] ops Callback table. This is copied.
+ * @param[in] arg Argument to pass to callbacks.
+ * @param[in] enable_index Insert the finder into the list of enabled finders at
+ * the given index. If @ref DRGN_HANDLER_REGISTER_ENABLE_LAST or greater than
+ * the number of enabled finders, insert it at the end. If @ref
+ * DRGN_HANDLER_REGISTER_DONT_ENABLE, don’t enable the finder.
+ */
+struct drgn_error *
+drgn_program_register_debug_info_finder(struct drgn_program *prog,
+					const char *name,
+					const struct drgn_debug_info_finder_ops *ops,
+					void *arg, size_t enable_index);
+
+/**
+ * Get the names of all registered debugging information finders.
+ *
+ * The order of the names is arbitrary.
+ *
+ * @param[out] names_ret Returned array of names.
+ * @param[out] count_ret Returned number of names in @p names_ret.
+ */
+struct drgn_error *
+drgn_program_registered_debug_info_finders(struct drgn_program *prog,
+					   const char ***names_ret,
+					   size_t *count_ret);
+
+/**
+ * Set the list of enabled debugging information finders.
+ *
+ * Finders are called in the same order as the list until all wanted files have
+ * been found.
+ *
+ * @param[in] names Names of finders to enable, in order.
+ * @param[in] count Number of names in @p names.
+ */
+struct drgn_error *
+drgn_program_set_enabled_debug_info_finders(struct drgn_program *prog,
+					    const char * const *names,
+					    size_t count);
+
+/**
+ * Get the names of enabled debugging information finders, in order.
+ *
+ * @param[out] names_ret Returned array of names.
+ * @param[out] count_ret Returned number of names in @p names_ret.
+ */
+struct drgn_error *
+drgn_program_enabled_debug_info_finders(struct drgn_program *prog,
+					const char ***names_ret,
+					size_t *count_ret);
+
+/** Colon-separated directories to search for debugging information files. */
+const char *drgn_program_debug_info_path(struct drgn_program *prog);
+
+/** Set the directories to search for debugging information files. */
+struct drgn_error *drgn_program_set_debug_info_path(struct drgn_program *prog,
+						    const char *path);
+
+/**
+ * Try to use the given file for a module.
+ *
+ * @param[in] path Path to file.
+ * @param[in] fd If nonnegative, an open file descriptor referring to the file.
+ * This always takes ownership of the file descriptor even if the file is not
+ * used or on error.
+ * @param[in] force If @c true, don't check whether the file matches the module.
+ */
+struct drgn_error *
+drgn_module_try_file(struct drgn_module *module, const char *path, int fd,
+		     bool force);
+
+/** Iterator over a set of modules. */
+struct drgn_module_iterator;
+
+/** Destroy a @ref drgn_module_iterator. */
+void
+drgn_module_iterator_destroy(struct drgn_module_iterator *it);
+
+/** Get the program that a module iterator is from. */
+struct drgn_program *
+drgn_module_iterator_program(const struct drgn_module_iterator *it);
+
+/**
+ * Get the next module in a module iterator.
+ *
+ * @param[out] ret Returned module.
+ * @param[out] new_ret Whether the module was newly created. May be @c NULL.
+ */
+struct drgn_error *drgn_module_iterator_next(struct drgn_module_iterator *it,
+					     struct drgn_module **ret,
+					     bool *new_ret);
+
+/** Create an iterator over created modules. */
+struct drgn_error *
+drgn_created_module_iterator_create(struct drgn_program *prog,
+				    struct drgn_module_iterator **ret);
+
+/**
+ * Create an iterator that determines what executables, libraries, etc. are
+ * loaded in the program and creates modules to represent them.
+ */
+struct drgn_error *
+drgn_loaded_module_iterator_create(struct drgn_program *prog,
+				   struct drgn_module_iterator **ret);
+
+/**
+ * Load debugging information for the given set of files and/or modules.
+ *
+ * @param[in] load_default Whether to load all debugging information for all
+ * loaded modules. This implies @p load_main.
+ * @param[in] load_main Whether to load all debugging information for the main
+ * module.
+ */
+struct drgn_error *drgn_program_load_debug_info(struct drgn_program *prog,
+						const char **paths, size_t n,
+						bool load_default,
+						bool load_main);
+
+/**
+ * Load debugging information for the given modules using the enabled debugging
+ * information finders.
+ */
+struct drgn_error *drgn_load_module_debug_info(struct drgn_module **modules,
+					       size_t *num_modules);
+
+/** @} */
+
+/**
  * @defgroup Logging Logging
  *
  * Logging configuration.
@@ -968,6 +1737,12 @@ struct drgn_error *drgn_program_element_info(struct drgn_program *prog,
  *
  * By default, the log file is set to `stderr` and the log level is @ref
  * DRGN_LOG_NONE, so logging is disabled.
+ *
+ * Additionally, drgn can display a progress bar for some operations, like
+ * downloading debugging information. By default, progress bars are displayed on
+ * standard error if standard error is a terminal, the log file is set to
+ * `stderr`, and the log level is less than or equal to @ref DRGN_LOG_WARNING,
+ * but this can be changed (@ref drgn_program_set_progress_file()).
  *
  * @{
  */
@@ -1040,6 +1815,13 @@ void drgn_program_get_log_callback(struct drgn_program *prog,
 				   drgn_log_fn **callback_ret,
 				   void **callback_arg_ret);
 
+/**
+ * Write progress bars to the given file.
+ *
+ * @param[in] file File, or @c NULL to disable progress bars.
+ */
+void drgn_program_set_progress_file(struct drgn_program *prog, FILE *file);
+
 /** @} */
 
 /**
@@ -1065,7 +1847,8 @@ typedef void *drgn_program_begin_blocking_fn(struct drgn_program *prog,
  *
  * @param[in] arg @c callback_arg passed to @ref
  * drgn_program_set_blocking_callback().
- * @param[in] state Return value of @ref drgn_program_begin_blocking_fn().
+ * @param[in] state Return value of matching call to @ref
+ * drgn_program_begin_blocking_fn().
  */
 typedef void drgn_program_end_blocking_fn(struct drgn_program *prog,
 					  void *arg, void *state);
@@ -1077,6 +1860,7 @@ typedef void drgn_program_end_blocking_fn(struct drgn_program *prog,
  * long-running computations. They are intended for things like releasing the
  * [global interpreter
  * lock](https://docs.python.org/3/glossary.html#term-global-interpreter-lock).
+ * Calls to these callbacks may be nested, but they will always be matched.
  *
  * @param[in] begin_callback Callback called before a blocking operation. Can be
  * @c NULL to unset.
@@ -1854,22 +2638,41 @@ struct drgn_error *drgn_format_object(const struct drgn_object *obj,
  */
 
 /**
- * Set a @ref drgn_object to the value of an object casted to a another type.
+ * Set a @ref drgn_object to the value of an object explicitly casted to a
+ * another type.
  *
- * Objects with a scalar type can be casted to a different scalar type. Other
- * objects can only be casted to the same type. @p res is always set to a value
- * object.
+ * This uses the programming language's rules for explicit conversions, like the
+ * cast operator.
  *
- * @sa drgn_object_reinterpret()
+ * @sa drgn_object_implicit_convert(), drgn_object_reinterpret()
  *
- * @param[out] res Object to set.
+ * @param[out] res Object to set. Always set to a value object.
  * @param[in] qualified_type New type.
- * @param[in] obj Object to read.
+ * @param[in] obj Object to cast.
  * @return @c NULL on success, non-@c NULL on error.
  */
 struct drgn_error *drgn_object_cast(struct drgn_object *res,
 				    struct drgn_qualified_type qualified_type,
 				    const struct drgn_object *obj);
+
+/**
+ * Set a @ref drgn_object to the value of an object implicitly converted to a
+ * another type.
+ *
+ * This uses the programming language's rules for implicit conversions, like
+ * when assigning to a variable or passing arguments to a function call.
+ *
+ * @sa drgn_object_cast(), drgn_object_reinterpret()
+ *
+ * @param[out] res Object to set. Always set to a value object.
+ * @param[in] qualified_type New type.
+ * @param[in] obj Object to convert.
+ * @return @c NULL on success, non-@c NULL on error.
+ */
+struct drgn_error *
+drgn_object_implicit_convert(struct drgn_object *res,
+			     struct drgn_qualified_type qualified_type,
+			     const struct drgn_object *obj);
 
 /**
  * Set a @ref drgn_object to the representation of an object reinterpreted as
@@ -1878,12 +2681,10 @@ struct drgn_error *drgn_object_cast(struct drgn_object *res,
  * This reinterprets the raw memory of the object, so an object can be
  * reinterpreted as any other type.
  *
- * If @c obj is a value, then @c res is set to a value; if @c obj is a
- * reference, then @c res is set to a reference.
+ * @sa drgn_object_cast(), drgn_object_implicit_convert()
  *
- * @sa drgn_object_cast()
- *
- * @param[out] res Object to set.
+ * @param[out] res Object to set. If @p obj is a value, set to a value. If @p
+ * obj is a reference, set to a reference.
  * @param[in] qualified_type New type.
  * @param[in] obj Object to reinterpret.
  * @return @c NULL on success, non-@c NULL on error.
@@ -2147,8 +2948,8 @@ union drgn_lazy_object {
  * field @c foo, there is a @c drgn_type_kind_has_foo() helper which returns
  * whether the given kind of type has the field @c foo; a @c drgn_type_has_foo()
  * helper which does the same but takes a type; and a @c drgn_type_foo() helper
- * which returns the field. For members, enumerators, and parameters, there is
- * also a @c drgn_type_num_foo() helper.
+ * which returns the field. For members, enumerators, parameters, and template
+ * parameters, there is also a @c drgn_type_num_foo() helper.
  *
  * @{
  */
@@ -2244,63 +3045,21 @@ struct drgn_type_template_parameter {
 };
 
 /**
- * Language-agnostic type descriptor.
+ * @struct drgn_type
  *
- * This structure should not be accessed directly; see @ref Types.
+ * Type descriptor.
+ *
+ * Access it with the getters in @ref Types.
  */
-struct drgn_type {
-	/** @privatesection */
-	struct {
-		enum drgn_type_kind kind;
-		bool is_complete;
-		enum drgn_primitive_type primitive;
-		/* These are the qualifiers for the wrapped type, not this type. */
-		enum drgn_qualifiers qualifiers;
-		struct drgn_program *program;
-		const struct drgn_language *language;
-		/*
-		 * This mess of unions is used to make this as compact as possible. Use
-		 * the provided helpers and don't think about it.
-		 */
-		union {
-			const char *name;
-			const char *tag;
-			size_t num_parameters;
-		};
-		union {
-			uint64_t size;
-			uint64_t length;
-			size_t num_enumerators;
-			bool is_variadic;
-		};
-		union {
-			bool is_signed;
-			size_t num_members;
-			struct drgn_type *type;
-		};
-		union {
-			bool little_endian;
-			struct drgn_type_member *members;
-			struct drgn_type_enumerator *enumerators;
-			struct drgn_type_parameter *parameters;
-		};
-		struct drgn_type_template_parameter *template_parameters;
-		size_t num_template_parameters;
-	} _private;
-};
+struct drgn_type;
 
 /** Get the kind of a type. */
-static inline enum drgn_type_kind drgn_type_kind(struct drgn_type *type)
-{
-	return type->_private.kind;
-}
+DRGN_ACCESSOR_LINKAGE
+enum drgn_type_kind drgn_type_kind(struct drgn_type *type);
 
 /** Get the primitive type corresponding to a @ref drgn_type. */
-static inline enum drgn_primitive_type
-drgn_type_primitive(struct drgn_type *type)
-{
-	return type->_private.primitive;
-}
+DRGN_ACCESSOR_LINKAGE
+enum drgn_primitive_type drgn_type_primitive(struct drgn_type *type);
 
 /**
  * Get whether a type is complete (i.e., the type definition is known).
@@ -2309,23 +3068,8 @@ drgn_type_primitive(struct drgn_type *type)
  * union, class, enumerated, and array types, as well as typedef types where the
  * underlying type is one of those. Otherwise, it is always @c true.
  */
-static inline bool drgn_type_is_complete(struct drgn_type *type)
-{
-	return type->_private.is_complete;
-}
-
-static inline struct drgn_program *
-drgn_type_program(struct drgn_type *type)
-{
-	return type->_private.program;
-}
-
-/** Get the language of a type. */
-static inline const struct drgn_language *
-drgn_type_language(struct drgn_type *type)
-{
-	return type->_private.language;
-}
+DRGN_ACCESSOR_LINKAGE
+bool drgn_type_is_complete(struct drgn_type *type);
 
 /**
  * Get whether a kind of type has a name. This is true for integer, boolean,
@@ -2346,11 +3090,8 @@ static inline bool drgn_type_has_name(struct drgn_type *type)
 /**
  * Get the name of a type. @ref drgn_type_has_name() must be true for this type.
  */
-static inline const char *drgn_type_name(struct drgn_type *type)
-{
-	assert(drgn_type_has_name(type));
-	return type->_private.name;
-}
+DRGN_ACCESSOR_LINKAGE
+const char *drgn_type_name(struct drgn_type *type);
 
 /**
  * Get whether a kind of type has a size. This is true for integer, boolean,
@@ -2375,11 +3116,8 @@ static inline bool drgn_type_has_size(struct drgn_type *type)
  * Get the size of a type in bytes. @ref drgn_type_has_size() must be true for
  * this type.
  */
-static inline uint64_t drgn_type_size(struct drgn_type *type)
-{
-	assert(drgn_type_has_size(type));
-	return type->_private.size;
-}
+DRGN_ACCESSOR_LINKAGE
+uint64_t drgn_type_size(struct drgn_type *type);
 
 /**
  * Get whether a kind of type has a signedness. This is true for integer types.
@@ -2397,11 +3135,8 @@ static inline bool drgn_type_has_is_signed(struct drgn_type *type)
  * Get the signedness of a type. @ref drgn_type_has_is_signed() must be true for
  * this type.
  */
-static inline bool drgn_type_is_signed(struct drgn_type *type)
-{
-	assert(drgn_type_has_is_signed(type));
-	return type->_private.is_signed;
-}
+DRGN_ACCESSOR_LINKAGE
+bool drgn_type_is_signed(struct drgn_type *type);
 
 /**
  * Get whether a kind of type has a byte order. This is true for integer,
@@ -2427,11 +3162,8 @@ static inline bool drgn_type_has_little_endian(struct drgn_type *type)
  *
  * @return @c true if the type is little-endian, @c false if it is big-endian.
  */
-static inline bool drgn_type_little_endian(struct drgn_type *type)
-{
-	assert(drgn_type_has_little_endian(type));
-	return type->_private.little_endian;
-}
+DRGN_ACCESSOR_LINKAGE
+bool drgn_type_little_endian(struct drgn_type *type);
 
 /**
  * Get whether a kind of type has a tag. This is true for structure, union,
@@ -2452,11 +3184,8 @@ static inline bool drgn_type_has_tag(struct drgn_type *type)
 /**
  * Get the tag of a type. @ref drgn_type_has_tag() must be true for this type.
  */
-static inline const char *drgn_type_tag(struct drgn_type *type)
-{
-	assert(drgn_type_has_tag(type));
-	return type->_private.tag;
-}
+DRGN_ACCESSOR_LINKAGE
+const char *drgn_type_tag(struct drgn_type *type);
 
 /**
  * Get whether a kind of type has members. This is true for structure, union,
@@ -2477,20 +3206,14 @@ static inline bool drgn_type_has_members(struct drgn_type *type)
  * Get the members of a type. @ref drgn_type_has_members() must be true for this
  * type.
  */
-static inline struct drgn_type_member *drgn_type_members(struct drgn_type *type)
-{
-	assert(drgn_type_has_members(type));
-	return type->_private.members;
-}
+DRGN_ACCESSOR_LINKAGE
+struct drgn_type_member *drgn_type_members(struct drgn_type *type);
 /**
  * Get the number of members of a type. @ref drgn_type_has_members() must be
  * true for this type. If the type is incomplete, this is always zero.
  */
-static inline size_t drgn_type_num_members(struct drgn_type *type)
-{
-	assert(drgn_type_has_members(type));
-	return type->_private.num_members;
-}
+DRGN_ACCESSOR_LINKAGE
+size_t drgn_type_num_members(struct drgn_type *type);
 
 /**
  * Get whether a kind of type has a wrapped type. This is true for enumerated,
@@ -2523,15 +3246,8 @@ static inline bool drgn_type_has_type(struct drgn_type *type)
  *
  * For a function type, this is the return type.
  */
-static inline struct drgn_qualified_type
-drgn_type_type(struct drgn_type *type)
-{
-	assert(drgn_type_has_type(type));
-	return (struct drgn_qualified_type){
-		.type = type->_private.type,
-		.qualifiers = type->_private.qualifiers,
-	};
-}
+DRGN_ACCESSOR_LINKAGE
+struct drgn_qualified_type drgn_type_type(struct drgn_type *type);
 
 /**
  * Get whether a kind of type has enumerators. This is true for enumerated
@@ -2550,21 +3266,14 @@ static inline bool drgn_type_has_enumerators(struct drgn_type *type)
  * Get the enumerators of a type. @ref drgn_type_has_enumerators() must be true
  * for this type.
  */
-static inline struct drgn_type_enumerator *
-drgn_type_enumerators(struct drgn_type *type)
-{
-	assert(drgn_type_has_enumerators(type));
-	return type->_private.enumerators;
-}
+DRGN_ACCESSOR_LINKAGE
+struct drgn_type_enumerator *drgn_type_enumerators(struct drgn_type *type);
 /**
  * Get the number of enumerators of a type. @ref drgn_type_has_enumerators()
  * must be true for this type. If the type is incomplete, this is always zero.
  */
-static inline size_t drgn_type_num_enumerators(struct drgn_type *type)
-{
-	assert(drgn_type_has_enumerators(type));
-	return type->_private.num_enumerators;
-}
+DRGN_ACCESSOR_LINKAGE
+size_t drgn_type_num_enumerators(struct drgn_type *type);
 
 /** Get whether a kind of type has a length. This is true for array types. */
 static inline bool drgn_type_kind_has_length(enum drgn_type_kind kind)
@@ -2580,11 +3289,8 @@ static inline bool drgn_type_has_length(struct drgn_type *type)
  * Get the length of a type. @ref drgn_type_has_length() must be true for this
  * type. If the type is incomplete, this is always zero.
  */
-static inline uint64_t drgn_type_length(struct drgn_type *type)
-{
-	assert(drgn_type_has_length(type));
-	return type->_private.length;
-}
+DRGN_ACCESSOR_LINKAGE
+uint64_t drgn_type_length(struct drgn_type *type);
 
 /**
  * Get whether a kind of type has parameters. This is true for function types.
@@ -2602,20 +3308,14 @@ static inline bool drgn_type_has_parameters(struct drgn_type *type)
  * Get the parameters of a type. @ref drgn_type_has_parameters() must be true
  * for this type.
  */
-static inline struct drgn_type_parameter *drgn_type_parameters(struct drgn_type *type)
-{
-	assert(drgn_type_has_parameters(type));
-	return type->_private.parameters;
-}
+DRGN_ACCESSOR_LINKAGE
+struct drgn_type_parameter *drgn_type_parameters(struct drgn_type *type);
 /**
  * Get the number of parameters of a type. @ref drgn_type_has_parameters() must
  * be true for this type.
  */
-static inline size_t drgn_type_num_parameters(struct drgn_type *type)
-{
-	assert(drgn_type_has_parameters(type));
-	return type->_private.num_parameters;
-}
+DRGN_ACCESSOR_LINKAGE
+size_t drgn_type_num_parameters(struct drgn_type *type);
 
 /**
  * Get whether a kind of type can be variadic. This is true for function types.
@@ -2633,11 +3333,8 @@ static inline bool drgn_type_has_is_variadic(struct drgn_type *type)
  * Get whether a type is variadic. @ref drgn_type_has_is_variadic() must be true
  * for this type.
  */
-static inline bool drgn_type_is_variadic(struct drgn_type *type)
-{
-	assert(drgn_type_has_is_variadic(type));
-	return type->_private.is_variadic;
-}
+DRGN_ACCESSOR_LINKAGE
+bool drgn_type_is_variadic(struct drgn_type *type);
 
 /** Get whether a kind of type can have template parameters. */
 static inline bool
@@ -2648,33 +3345,24 @@ drgn_type_kind_has_template_parameters(enum drgn_type_kind kind)
 		kind == DRGN_TYPE_CLASS ||
 		kind == DRGN_TYPE_FUNCTION);
 }
-
 /** Get whether a type can have template parameters. */
 static inline bool drgn_type_has_template_parameters(struct drgn_type *type)
 {
 	return drgn_type_kind_has_template_parameters(drgn_type_kind(type));
 }
-
 /**
  * Get the template parameters of a type. @ref
  * drgn_type_has_template_parameters() must be true for this type.
  */
-static inline struct drgn_type_template_parameter *
-drgn_type_template_parameters(struct drgn_type *type)
-{
-	assert(drgn_type_has_template_parameters(type));
-	return type->_private.template_parameters;
-}
-
+DRGN_ACCESSOR_LINKAGE
+struct drgn_type_template_parameter *
+drgn_type_template_parameters(struct drgn_type *type);
 /**
  * Get the number of template parameters of a type. @ref
  * drgn_type_has_template_parameters() must be true for this type.
  */
-static inline size_t drgn_type_num_template_parameters(struct drgn_type *type)
-{
-	assert(drgn_type_has_template_parameters(type));
-	return type->_private.num_template_parameters;
-}
+DRGN_ACCESSOR_LINKAGE
+size_t drgn_type_num_template_parameters(struct drgn_type *type);
 
 /**
  * Get the object corresponding to a @ref drgn_type_member.
@@ -2764,6 +3452,18 @@ drgn_template_parameter_object(struct drgn_type_template_parameter *parameter,
  * @return @c NULL on success, non-@c NULL on error.
  */
 struct drgn_error *drgn_type_sizeof(struct drgn_type *type, uint64_t *ret);
+
+/**
+ * Get the alignment requirement of a type.
+ *
+ * This corresponds to @c _Alignof() in C.
+ *
+ * @param[in] type Type.
+ * @param[out] ret Returned alignment.
+ * @return @c NULL on success, non-@c NULL on error.
+ */
+struct drgn_error *drgn_type_alignof(struct drgn_qualified_type qualified_type,
+				     uint64_t *ret);
 
 /**
  * Get the offset in bytes of a member from the start of a structure, union, or
@@ -2881,7 +3581,7 @@ enum drgn_symbol_binding {
 	DRGN_SYMBOL_BINDING_GLOBAL,
 	DRGN_SYMBOL_BINDING_WEAK,
 	DRGN_SYMBOL_BINDING_UNIQUE = 11, /* STB_GNU_UNIQUE + 1 */
-};
+} __attribute__((__packed__));
 
 /** Kind of entity represented by a symbol. */
 enum drgn_symbol_kind {
@@ -2897,7 +3597,45 @@ enum drgn_symbol_kind {
 	DRGN_SYMBOL_KIND_COMMON,
 	DRGN_SYMBOL_KIND_TLS,
 	DRGN_SYMBOL_KIND_IFUNC = 10, /* STT_GNU_IFUNC */
-};
+} __attribute__((__packed__));
+
+/** Describes the lifetime of an object provided to drgn */
+enum drgn_lifetime {
+	/**
+	 * DRGN_LIFETIME_STATIC: the object is guaranteed to outlive the
+	 * drgn_program itself. drgn will not free or copy the object.
+	 */
+	DRGN_LIFETIME_STATIC,
+	/**
+	 * DRGN_LIFETIME_EXTERNAL: the object is externally managed. It will
+	 * live as long as the object it is associated with, but may be freed
+	 * after. drgn will never free the object. If drgn must copy a data
+	 * structure, the object will be duplicated, and drgn will own the new
+	 * object.
+	 */
+	DRGN_LIFETIME_EXTERNAL,
+	/**
+	 * DRGN_LIFETIME_OWNED: the object lifetime is managed by drgn. It
+	 * should be freed when the containing object is freed. If the
+	 * containing object is copied, it must also be copied.
+	 */
+	DRGN_LIFETIME_OWNED,
+} __attribute__((__packed__));
+
+/**
+ * Create a new @ref drgn_symbol with the given values
+ *
+ * All parameters should be self-explanatory, except for @a name_lifetime.
+ * Clients can use this to describe how drgn should treat the string @a name.
+ * Strings with lifetime @c STATIC will never be copied or freed. Strings with
+ * lifetime @c OWNED will always be copied or and freed with the symbol. Strings
+ * with lifetime EXTERNAL will not be freed, but if the Symbol is copied, they
+ * will be copied.
+ */
+struct drgn_error *
+drgn_symbol_create(const char *name, uint64_t address, uint64_t size,
+		   enum drgn_symbol_binding binding, enum drgn_symbol_kind kind,
+		   enum drgn_lifetime name_lifetime, struct drgn_symbol **ret);
 
 /** Destroy a @ref drgn_symbol. */
 void drgn_symbol_destroy(struct drgn_symbol *sym);
@@ -2980,12 +3718,23 @@ struct drgn_error *drgn_format_stack_frame(struct drgn_stack_trace *trace,
 					   size_t frame, char **ret);
 
 /**
+ * Get the best available name for a stack frame.
+ *
+ * @param[out] ret Returned name. On success, it must be freed with @c free().
+ * On error, it is not modified.
+ * @return @c NULL on success, non-@c NULL on error.
+ */
+struct drgn_error *drgn_stack_frame_name(struct drgn_stack_trace *trace,
+					 size_t frame, char **ret);
+
+/**
  * Get the name of the function at a stack frame.
  *
  * @return Function name. This is valid until the stack trace is destroyed; it
  * should not be freed. @c NULL if the name could not be determined.
  */
-const char *drgn_stack_frame_name(struct drgn_stack_trace *trace, size_t frame);
+const char *drgn_stack_frame_function_name(struct drgn_stack_trace *trace,
+					   size_t frame);
 
 /** Return whether a stack frame is for an inlined call. */
 bool drgn_stack_frame_is_inline(struct drgn_stack_trace *trace, size_t frame);
@@ -3232,6 +3981,15 @@ struct drgn_error *drgn_thread_object(struct drgn_thread *thread,
  */
 struct drgn_error *drgn_thread_stack_trace(struct drgn_thread *thread,
 					   struct drgn_stack_trace **ret);
+
+/**
+ * Get name for the thread represented by @p thread.
+ *
+ * @param[out] ret Returned thread name, or @c NULL if not found. On success, it
+ * should be freed with free(). On error, it is not modified.
+ * @return @c NULL on success, non-@c NULL on error.
+ */
+struct drgn_error *drgn_thread_name(struct drgn_thread *thread, char **ret);
 
 /** @} */
 

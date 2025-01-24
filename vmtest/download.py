@@ -29,7 +29,8 @@ from typing import (
 )
 import urllib.request
 
-from util import NORMALIZED_MACHINE_NAME, KernelVersion
+from _drgn_util.platform import NORMALIZED_MACHINE_NAME
+from util import KernelVersion
 from vmtest.config import (
     ARCHITECTURES,
     HOST_ARCHITECTURE,
@@ -284,9 +285,11 @@ def _download_thread(
 
 @contextmanager
 def download_in_thread(
-    download_dir: Path, downloads: Iterable[Download]
+    download_dir: Path, downloads: Iterable[Download], max_pending_kernels: int = 0
 ) -> Generator[Iterator[Downloaded], None, None]:
-    q: "queue.Queue[Union[Downloaded, Exception]]" = queue.Queue()
+    q: "queue.Queue[Union[Downloaded, Exception]]" = queue.Queue(
+        maxsize=max_pending_kernels
+    )
 
     def aux() -> Iterator[Downloaded]:
         while True:

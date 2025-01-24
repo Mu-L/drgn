@@ -14,7 +14,8 @@
 
 #include <assert.h>
 
-#include "drgn.h"
+#include "drgn_internal.h"
+#include "handler.h"
 #include "hash_table.h"
 #include "vector.h"
 
@@ -50,20 +51,10 @@ drgn_byte_order_from_little_endian(bool little_endian)
 
 /** Registered type finding callback in a @ref drgn_program. */
 struct drgn_type_finder {
-	/** The callback. */
-	drgn_type_find_fn fn;
-	/** Argument to pass to @ref drgn_type_finder::fn. */
+	struct drgn_handler handler;
+	struct drgn_type_finder_ops ops;
 	void *arg;
-	/** Next callback to try. */
-	struct drgn_type_finder *next;
-	/** Whether this structure needs to be freed. */
-	bool free;
 };
-
-struct drgn_error *
-drgn_program_add_type_finder_impl(struct drgn_program *prog,
-				  struct drgn_type_finder *finder,
-				  drgn_type_find_fn fn, void *arg);
 
 DEFINE_HASH_SET_TYPE(drgn_dedupe_type_set, struct drgn_type *);
 
@@ -509,8 +500,8 @@ static inline struct drgn_type *drgn_underlying_type(struct drgn_type *type)
  */
 static inline bool drgn_enum_type_is_signed(struct drgn_type *type)
 {
-	assert(type->_private.type);
-	return drgn_type_is_signed(type->_private.type);
+	assert(type->_type);
+	return drgn_type_is_signed(type->_type);
 }
 
 /**
@@ -564,6 +555,9 @@ bool drgn_type_is_scalar(struct drgn_type *type);
  */
 struct drgn_error *drgn_type_bit_size(struct drgn_type *type,
 				      uint64_t *ret);
+
+struct drgn_error *drgn_dwarf_type_alignment(struct drgn_type *type,
+					     uint64_t *ret);
 
 /** Initialize type-related fields in a @ref drgn_program. */
 void drgn_program_init_types(struct drgn_program *prog);

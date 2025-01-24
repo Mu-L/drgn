@@ -20,16 +20,19 @@
 
 #include "cleanup.h"
 #include "debug_info.h"
+#include "elf_notes.h"
 #include "error.h"
 #include "helpers.h"
 #include "io.h"
 #include "language.h"
 #include "log.h"
 #include "linux_kernel.h"
+#include "log.h"
 #include "memory_reader.h"
 #include "minmax.h"
-#include "object_index.h"
+#include "object.h"
 #include "program.h"
+#include "serialize.h"
 #include "symbol.h"
 #include "util.h"
 #include "vector.h"
@@ -39,7 +42,6 @@ static inline uint32_t drgn_thread_to_key(const struct drgn_thread *entry)
 	return entry->tid;
 }
 
-DEFINE_VECTOR_FUNCTIONS(drgn_prstatus_vector);
 DEFINE_HASH_TABLE_FUNCTIONS(drgn_thread_set, drgn_thread_to_key,
 			    int_key_hash_pair, scalar_key_eq);
 
@@ -76,7 +78,27 @@ drgn_program_platform(struct drgn_program *prog)
 LIBDRGN_PUBLIC const struct drgn_language *
 drgn_program_language(struct drgn_program *prog)
 {
-	return prog->lang ? prog->lang : &drgn_default_language;
+	if (prog->lang)
+		return prog->lang;
+	if (prog->flags & DRGN_PROGRAM_IS_LINUX_KERNEL) {
+		prog->lang = &drgn_language_c;
+		return prog->lang;
+	}
+	if (!prog->tried_main_language) {
+		prog->tried_main_language = true;
+		prog->lang = drgn_debug_info_main_language(&prog->dbinfo);
+		if (prog->lang) {
+			drgn_log_debug(prog,
+				       "set default language to %s from main()",
+				       prog->lang->name);
+			return prog->lang;
+		} else {
+			drgn_log_debug(prog,
+				       "couldn't find language of main(); defaulting to %s",
+				       drgn_default_language.name);
+		}
+	}
+	return &drgn_default_language;
 }
 
 LIBDRGN_PUBLIC void drgn_program_set_language(struct drgn_program *prog,
@@ -100,41 +122,44 @@ void drgn_program_init(struct drgn_program *prog,
 	memset(prog, 0, sizeof(*prog));
 	drgn_memory_reader_init(&prog->reader);
 	drgn_program_init_types(prog);
-	drgn_object_index_init(&prog->oindex);
 	drgn_debug_info_init(&prog->dbinfo, prog);
 	prog->core_fd = -1;
 	if (platform)
 		drgn_program_set_platform(prog, platform);
-	char *env = getenv("DRGN_PREFER_ORC_UNWINDER");
-	prog->prefer_orc_unwinder = env && atoi(env);
+	drgn_thread_set_init(&prog->thread_set);
 	drgn_program_set_log_level(prog, DRGN_LOG_NONE);
 	drgn_program_set_log_file(prog, stderr);
+	prog->default_progress_file = true;
 	drgn_object_init(&prog->vmemmap, prog);
 }
 
 void drgn_program_deinit(struct drgn_program *prog)
 {
-	if (prog->core_dump_notes_cached) {
-		if (prog->flags & DRGN_PROGRAM_IS_LINUX_KERNEL)
-			drgn_prstatus_vector_deinit(&prog->prstatus_vector);
-		else
-			drgn_thread_set_deinit(&prog->thread_set);
-	}
+	drgn_thread_set_deinit(&prog->thread_set);
 	/*
 	 * For userspace core dumps, main_thread and crashed_thread are in
 	 * prog->thread_set and thus freed by the above call to
 	 * drgn_thread_set_deinit().
 	 */
-	if (prog->flags & DRGN_PROGRAM_IS_LINUX_KERNEL)
+	if (!drgn_program_is_userspace_core(prog)) {
 		drgn_thread_destroy(prog->crashed_thread);
-	else if (prog->flags & DRGN_PROGRAM_IS_LIVE)
 		drgn_thread_destroy(prog->main_thread);
+	}
 	if (prog->pgtable_it)
 		prog->platform.arch->linux_kernel_pgtable_iterator_destroy(prog->pgtable_it);
 
 	drgn_object_deinit(&prog->vmemmap);
 
-	drgn_object_index_deinit(&prog->oindex);
+	drgn_handler_list_deinit(struct drgn_symbol_finder, finder,
+				 &prog->symbol_finders,
+		if (finder->ops.destroy)
+			finder->ops.destroy(finder->arg);
+	);
+	drgn_handler_list_deinit(struct drgn_object_finder, finder,
+				 &prog->object_finders,
+		if (finder->ops.destroy)
+			finder->ops.destroy(finder->arg);
+	);
 	drgn_program_deinit_types(prog);
 	drgn_memory_reader_deinit(&prog->reader);
 
@@ -191,20 +216,82 @@ drgn_program_add_memory_segment(struct drgn_program *prog, uint64_t address,
 					      physical);
 }
 
-struct drgn_error *
-drgn_program_add_object_finder_impl(struct drgn_program *prog,
-				    struct drgn_object_finder *finder,
-				    drgn_object_find_fn fn, void *arg)
-{
-	return drgn_object_index_add_finder(&prog->oindex, finder, fn, arg);
+#define DRGN_PROGRAM_FINDER(which)						\
+struct drgn_error *								\
+drgn_program_register_##which##_finder_impl(struct drgn_program *prog,		\
+					    struct drgn_##which##_finder *finder,\
+					    const char *name,			\
+					    const struct drgn_##which##_finder_ops *ops,\
+					    void *arg, size_t enable_index)	\
+{										\
+	struct drgn_error *err;							\
+	if (finder) {								\
+		finder->handler.name = name;					\
+		finder->handler.free = false;					\
+	} else {								\
+		finder = malloc(sizeof(*finder));				\
+		if (!finder)							\
+			return &drgn_enomem;					\
+		finder->handler.name = strdup(name);				\
+		if (!finder->handler.name) {					\
+			free(finder);						\
+			return &drgn_enomem;					\
+		}								\
+		finder->handler.free = true;					\
+	}									\
+	memcpy(&finder->ops, ops, sizeof(finder->ops));				\
+	finder->arg = arg;							\
+	err = drgn_handler_list_register(&prog->which##_finders,		\
+					 &finder->handler, enable_index,	\
+					 #which " finder");			\
+	if (err && finder->handler.free) {					\
+		free((char *)finder->handler.name);				\
+		free(finder);							\
+	}									\
+	return err;								\
+}										\
+										\
+LIBDRGN_PUBLIC struct drgn_error *						\
+drgn_program_register_##which##_finder(struct drgn_program *prog, const char *name,\
+				       const struct drgn_##which##_finder_ops *ops,\
+				       void *arg, size_t enable_index)		\
+{										\
+	return drgn_program_register_##which##_finder_impl(prog, NULL, name,	\
+							   ops, arg,		\
+							   enable_index);	\
+}										\
+										\
+LIBDRGN_PUBLIC struct drgn_error *						\
+drgn_program_registered_##which##_finders(struct drgn_program *prog,		\
+					  const char ***names_ret,		\
+					  size_t *count_ret)			\
+{										\
+	return drgn_handler_list_registered(&prog->which##_finders, names_ret,	\
+					    count_ret);				\
+}										\
+										\
+LIBDRGN_PUBLIC struct drgn_error *						\
+drgn_program_set_enabled_##which##_finders(struct drgn_program *prog,		\
+					   const char * const *names,		\
+					   size_t count)			\
+{										\
+	return drgn_handler_list_set_enabled(&prog->which##_finders, names,	\
+					     count, #which "finder");		\
+}										\
+										\
+LIBDRGN_PUBLIC struct drgn_error *						\
+drgn_program_enabled_##which##_finders(struct drgn_program *prog,		\
+				       const char ***names_ret,			\
+				       size_t *count_ret)			\
+{										\
+	return drgn_handler_list_enabled(&prog->which##_finders, names_ret,	\
+					 count_ret);				\
 }
 
-LIBDRGN_PUBLIC struct drgn_error *
-drgn_program_add_object_finder(struct drgn_program *prog,
-			       drgn_object_find_fn fn, void *arg)
-{
-	return drgn_program_add_object_finder_impl(prog, NULL, fn, arg);
-}
+DRGN_PROGRAM_FINDER(type)
+DRGN_PROGRAM_FINDER(object)
+DRGN_PROGRAM_FINDER(symbol)
+#undef DRGN_PROGRAM_FINDER
 
 static struct drgn_error *
 drgn_program_check_initialized(struct drgn_program *prog)
@@ -252,6 +339,8 @@ drgn_program_set_core_dump_fd_internal(struct drgn_program *prog, int fd,
 	const char *vmcoreinfo_note = NULL;
 	size_t vmcoreinfo_size = 0;
 	bool have_nt_taskstruct = false, is_proc_kcore;
+	bool have_vmcoreinfo = prog->vmcoreinfo.raw;
+	bool had_vmcoreinfo = have_vmcoreinfo;
 
 	prog->core_fd = fd;
 	err = has_kdump_signature(prog, path, &is_kdump);
@@ -361,6 +450,7 @@ drgn_program_set_core_dump_fd_internal(struct drgn_program *prog, int fd,
 					 * may be valid.
 					 */
 					have_phys_addrs = true;
+					have_vmcoreinfo = true;
 				} else if (nhdr.n_namesz == sizeof("QEMU") &&
 					   memcmp(name, "QEMU",
 						  sizeof("QEMU")) == 0) {
@@ -387,7 +477,7 @@ drgn_program_set_core_dump_fd_internal(struct drgn_program *prog, int fd,
 		is_proc_kcore = false;
 	}
 
-	if (vmcoreinfo_note && !is_proc_kcore) {
+	if (have_vmcoreinfo && !is_proc_kcore) {
 		char *env;
 
 		/* Use libkdumpfile for ELF vmcores if it was requested. */
@@ -408,7 +498,7 @@ drgn_program_set_core_dump_fd_internal(struct drgn_program *prog, int fd,
 	}
 
 	bool pgtable_reader =
-		(is_proc_kcore || vmcoreinfo_note) &&
+		(is_proc_kcore || have_vmcoreinfo) &&
 		prog->platform.arch->linux_kernel_pgtable_iterator_next;
 	if (pgtable_reader) {
 		/*
@@ -469,7 +559,7 @@ drgn_program_set_core_dump_fd_internal(struct drgn_program *prog, int fd,
 		 * all zeroes and memory that was excluded by makedumpfile for
 		 * another reason, so we're forced to always return zeroes.
 		 */
-		prog->file_segments[j].zerofill = vmcoreinfo_note && !is_proc_kcore;
+		prog->file_segments[j].zerofill = have_vmcoreinfo && !is_proc_kcore;
 		err = drgn_program_add_memory_segment(prog, phdr->p_vaddr,
 						      phdr->p_memsz,
 						      drgn_read_memory_file,
@@ -538,7 +628,7 @@ drgn_program_set_core_dump_fd_internal(struct drgn_program *prog, int fd,
 			j++;
 		}
 	}
-	if (vmcoreinfo_note) {
+	if (vmcoreinfo_note && !prog->vmcoreinfo.raw) {
 		err = drgn_program_parse_vmcoreinfo(prog, vmcoreinfo_note,
 						    vmcoreinfo_size);
 		if (err)
@@ -546,7 +636,7 @@ drgn_program_set_core_dump_fd_internal(struct drgn_program *prog, int fd,
 	}
 
 	if (is_proc_kcore) {
-		if (!vmcoreinfo_note) {
+		if (!have_vmcoreinfo) {
 			err = read_vmcoreinfo_fallback(prog);
 			if (err)
 				goto out_segments;
@@ -556,7 +646,7 @@ drgn_program_set_core_dump_fd_internal(struct drgn_program *prog, int fd,
 		                DRGN_PROGRAM_IS_LOCAL);
 		elf_end(prog->core);
 		prog->core = NULL;
-	} else if (vmcoreinfo_note) {
+	} else if (have_vmcoreinfo) {
 		prog->flags |= DRGN_PROGRAM_IS_LINUX_KERNEL;
 	} else if (have_qemu_note) {
 		err = drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
@@ -569,13 +659,9 @@ drgn_program_set_core_dump_fd_internal(struct drgn_program *prog, int fd,
 		goto out_segments;
 	}
 	if (prog->flags & DRGN_PROGRAM_IS_LINUX_KERNEL) {
-		err = drgn_program_add_object_finder(prog,
-						     linux_kernel_object_find,
-						     prog);
+		err = drgn_program_finish_set_kernel(prog);
 		if (err)
 			goto out_segments;
-		if (!prog->lang)
-			prog->lang = &drgn_language_c;
 	}
 
 	return NULL;
@@ -588,8 +674,11 @@ out_segments:
 out_notes:
 	// Reset anything we parsed from ELF notes.
 	prog->aarch64_insn_pac_mask = 0;
-	free(prog->vmcoreinfo.raw);
-	memset(&prog->vmcoreinfo, 0, sizeof(prog->vmcoreinfo));
+	// Free vmcoreinfo buffer if it was not provided by the caller
+	if (!had_vmcoreinfo) {
+		free(prog->vmcoreinfo.raw);
+		memset(&prog->vmcoreinfo, 0, sizeof(prog->vmcoreinfo));
+	}
 out_platform:
 	prog->has_platform = had_platform;
 out_elf:
@@ -692,63 +781,90 @@ out_fd:
 	return err;
 }
 
-/* Set the default language from the language of "main". */
-static void drgn_program_set_language_from_main(struct drgn_program *prog)
+struct drgn_error *drgn_program_cache_auxv(struct drgn_program *prog)
 {
-	struct drgn_error *err;
-
-	if (prog->flags & DRGN_PROGRAM_IS_LINUX_KERNEL)
-		return;
-	const struct drgn_language *lang;
-	err = drgn_debug_info_main_language(&prog->dbinfo, &lang);
-	if (err) {
-		drgn_error_destroy(err);
-		return;
-	}
-	if (lang)
-		prog->lang = lang;
-}
-
-static int drgn_set_platform_from_dwarf(Dwfl_Module *module, void **userdatap,
-					const char *name, Dwarf_Addr base,
-					Dwarf *dwarf, Dwarf_Addr bias,
-					void *arg)
-{
-	Elf *elf;
-	GElf_Ehdr ehdr_mem, *ehdr;
-	struct drgn_platform platform;
-
-	elf = dwarf_getelf(dwarf);
-	if (!elf)
-		return DWARF_CB_OK;
-	ehdr = gelf_getehdr(elf, &ehdr_mem);
-	if (!ehdr)
-		return DWARF_CB_OK;
-	drgn_platform_from_elf(ehdr, &platform);
-	drgn_program_set_platform(arg, &platform);
-	return DWARF_CB_ABORT;
-}
-
-LIBDRGN_PUBLIC struct drgn_error *
-drgn_program_load_debug_info(struct drgn_program *prog, const char **paths,
-			     size_t n, bool load_default, bool load_main)
-{
-	struct drgn_error *err;
-
-	if (!n && !load_default && !load_main)
+	if (prog->auxv_cached)
 		return NULL;
 
-	drgn_blocking_guard(prog);
-	err = drgn_debug_info_load(&prog->dbinfo, paths, n, load_default, load_main);
-	if ((!err || err->code == DRGN_ERROR_MISSING_DEBUG_INFO)) {
-		if (!prog->lang)
-			drgn_program_set_language_from_main(prog);
-		if (!prog->has_platform) {
-			dwfl_getdwarf(prog->dbinfo.dwfl,
-				      drgn_set_platform_from_dwarf, prog, 0);
+	_cleanup_close_ int fd = -1;
+	const void *note;
+	size_t note_size;
+#define FORMAT "/proc/%ld/auxv"
+	char path[sizeof(FORMAT)
+		  - sizeof("%ld")
+		  + max_decimal_length(long)
+		  + 1];
+	if (drgn_program_is_userspace_process(prog)) {
+		snprintf(path, sizeof(path), FORMAT, (long)prog->pid);
+#undef FORMAT
+		fd = open(path, O_RDONLY);
+		if (fd < 0)
+			return drgn_error_create_os("open", errno, path);
+		drgn_log_debug(prog, "parsing %s", path);
+	} else {
+		assert(drgn_program_is_userspace_core(prog));
+		if (find_elf_note(prog->core, "CORE", NT_AUXV, &note,
+				  &note_size))
+			return drgn_error_libelf();
+		if (!note) {
+			return drgn_error_create(DRGN_ERROR_OTHER,
+						 "core file is missing NT_AUXV");
+		}
+		drgn_log_debug(prog, "parsing NT_AUXV");
+	}
+
+	memset(&prog->auxv, 0, sizeof(prog->auxv));
+
+	bool is_64_bit = drgn_platform_is_64_bit(&prog->platform);
+	bool bswap = drgn_platform_bswap(&prog->platform);
+	size_t aux_size = is_64_bit ? 16 : 8;
+#define visit_aux_members(visit_scalar_member, visit_raw_member) do {	\
+	visit_scalar_member(a_type);					\
+	visit_scalar_member(a_un.a_val);				\
+} while (0)
+	for (;;) {
+		Elf64_auxv_t auxv;
+		if (fd >= 0) {
+			ssize_t r = read_all(fd, &auxv, aux_size);
+			if (r < 0)
+				return drgn_error_create_os("read", errno, path);
+			if (r < aux_size)
+				break;
+			deserialize_struct64_inplace(&auxv, Elf32_auxv_t,
+						     visit_aux_members,
+						     is_64_bit, bswap);
+		} else {
+			if (note_size < aux_size)
+				break;
+			deserialize_struct64(&auxv, Elf32_auxv_t,
+					     visit_aux_members, note, is_64_bit,
+					     bswap);
+			note = (char *)note + aux_size;
+			note_size -= aux_size;
+		}
+		if (auxv.a_type == 0 && auxv.a_un.a_val == 0)
+			break;
+		switch (auxv.a_type) {
+		case AT_PHDR:
+			drgn_log_debug(prog, "found AT_PHDR 0x%" PRIx64,
+				       auxv.a_un.a_val);
+			prog->auxv.at_phdr = auxv.a_un.a_val;
+			break;
+		case AT_PHNUM:
+			drgn_log_debug(prog, "found AT_PHNUM %" PRIu64,
+				       auxv.a_un.a_val);
+			prog->auxv.at_phnum = auxv.a_un.a_val;
+			break;
+		case AT_SYSINFO_EHDR:
+			drgn_log_debug(prog, "found AT_SYSINFO_EHDR 0x%" PRIx64,
+				       auxv.a_un.a_val);
+			prog->auxv.at_sysinfo_ehdr = auxv.a_un.a_val;
+			break;
 		}
 	}
-	return err;
+#undef visit_aux_members
+	prog->auxv_cached = true;
+	return NULL;
 }
 
 static struct drgn_error *get_prstatus_pid(struct drgn_program *prog, const char *data,
@@ -800,6 +916,35 @@ static struct drgn_error *get_prpsinfo_pid(struct drgn_program *prog,
 	return NULL;
 }
 
+static struct drgn_error *get_prpsinfo_fname(struct drgn_program *prog,
+					   const char *data, size_t size,
+					   const char **ret)
+{
+	bool is_64_bit;
+	struct drgn_error *err = drgn_program_is_64_bit(prog, &is_64_bit);
+	if (err)
+		return err;
+	size_t offset = is_64_bit ? 40 : 28;
+	// pr_fname is defined as 16 byte buffer in elf_prpsinfo
+	// https://github.com/torvalds/linux/blob/075dbe9f6e3c21596c5245826a4ee1f1c1676eb8/include/linux/elfcore.h#L73
+#define PR_FNAME_LEN 16
+	if (size < offset + PR_FNAME_LEN) {
+		return drgn_error_create(DRGN_ERROR_OTHER,
+					 "NT_PRPSINFO is truncated");
+	}
+	// No need to make a copy: the data returned by elf_getdata_rawchunk()
+	// is valid for the lifetime of the Elf handle, and prog->core is valid for
+	// the lifetime of prog.
+	const char *tmp = data + offset;
+	size_t len = strnlen(tmp, PR_FNAME_LEN);
+	if (len == PR_FNAME_LEN)
+#undef PR_FNAME_LEN
+		return drgn_error_create(DRGN_ERROR_OTHER,
+					 "pr_fname is not null terminated");
+	*ret = tmp;
+	return NULL;
+}
+
 struct drgn_error *drgn_thread_dup_internal(const struct drgn_thread *thread,
 					    struct drgn_thread *ret)
 {
@@ -820,8 +965,7 @@ struct drgn_error *drgn_thread_dup_internal(const struct drgn_thread *thread,
 LIBDRGN_PUBLIC struct drgn_error *
 drgn_thread_dup(const struct drgn_thread *thread, struct drgn_thread **ret)
 {
-	if (!(thread->prog->flags &
-	      (DRGN_PROGRAM_IS_LINUX_KERNEL | DRGN_PROGRAM_IS_LIVE))) {
+	if (drgn_program_is_userspace_core(thread->prog)) {
 		/*
 		 * For userspace core dumps, all threads are cached and
 		 * immutable, so we can return the same handle.
@@ -848,8 +992,7 @@ LIBDRGN_PUBLIC void drgn_thread_destroy(struct drgn_thread *thread)
 {
 	if (thread) {
 		drgn_thread_deinit(thread);
-		if (thread->prog->flags &
-		    (DRGN_PROGRAM_IS_LINUX_KERNEL | DRGN_PROGRAM_IS_LIVE))
+		if (!drgn_program_is_userspace_core(thread->prog))
 			free(thread);
 	}
 }
@@ -858,32 +1001,22 @@ struct drgn_error *drgn_program_cache_prstatus_entry(struct drgn_program *prog,
 						     const char *data,
 						     size_t size, uint32_t *ret)
 {
-	if (prog->flags & DRGN_PROGRAM_IS_LINUX_KERNEL) {
-		struct nstring *entry =
-			drgn_prstatus_vector_append_entry(&prog->prstatus_vector);
-		if (!entry)
-			return &drgn_enomem;
-		entry->str = data;
-		entry->len = size;
-	} else {
-		struct drgn_thread thread = {
-			.prog = prog,
-			.prstatus = { data, size },
-	       };
-		struct drgn_error *err = get_prstatus_pid(prog, data, size,
-							  &thread.tid);
-		if (err)
-			return err;
-		*ret = thread.tid;
-		if (drgn_thread_set_insert(&prog->thread_set, &thread,
-					   NULL) == -1)
-			return &drgn_enomem;
-	}
+	struct drgn_thread thread = {
+		.prog = prog,
+		.prstatus = { data, size },
+	};
+	struct drgn_error *err = get_prstatus_pid(prog, data, size,
+						  &thread.tid);
+	if (err)
+		return err;
+	*ret = thread.tid;
+	if (drgn_thread_set_insert(&prog->thread_set, &thread, NULL) == -1)
+		return &drgn_enomem;
 	return NULL;
 }
 
 static struct drgn_error *
-drgn_program_cache_core_dump_notes(struct drgn_program *prog)
+drgn_program_cache_core_dump_threads(struct drgn_program *prog)
 {
 	struct drgn_error *err;
 	size_t phnum, i;
@@ -891,20 +1024,16 @@ drgn_program_cache_core_dump_notes(struct drgn_program *prog)
 	uint32_t first_prstatus_tid;
 	bool found_prpsinfo = false;
 	uint32_t prpsinfo_pid;
+	const char *prpsinfo_fname = NULL;
 
-	if (prog->core_dump_notes_cached)
+	if (prog->core_dump_threads_cached)
 		return NULL;
 
 	assert(!(prog->flags & DRGN_PROGRAM_IS_LIVE));
 
-	if (prog->flags & DRGN_PROGRAM_IS_LINUX_KERNEL)
-		drgn_prstatus_vector_init(&prog->prstatus_vector);
-	else
-		drgn_thread_set_init(&prog->thread_set);
-
 #ifdef WITH_LIBKDUMPFILE
 	if (prog->kdump_ctx) {
-		err = drgn_program_cache_kdump_notes(prog);
+		err = drgn_program_cache_kdump_threads(prog);
 		if (err)
 			goto err;
 		goto out;
@@ -958,6 +1087,12 @@ drgn_program_cache_core_dump_notes(struct drgn_program *prog)
 						       &prpsinfo_pid);
 				if (err)
 					goto err;
+				err = get_prpsinfo_fname(prog,
+						       (char *)data->d_buf + desc_offset,
+						       nhdr.n_descsz,
+						       &prpsinfo_fname);
+				if (err)
+					goto err;
 				found_prpsinfo = true;
 			} else if (nhdr.n_type == NT_PRSTATUS) {
 				uint32_t tid;
@@ -981,7 +1116,7 @@ drgn_program_cache_core_dump_notes(struct drgn_program *prog)
 	}
 
 out:
-	prog->core_dump_notes_cached = true;
+	prog->core_dump_threads_cached = true;
 	if (!(prog->flags & DRGN_PROGRAM_IS_LINUX_KERNEL)) {
 		if (found_prpsinfo) {
 			struct drgn_thread_set_iterator it =
@@ -989,6 +1124,7 @@ out:
 						       &prpsinfo_pid);
 			/* If the PID isn't found, then this is NULL. */
 			prog->main_thread = it.entry;
+			prog->core_dump_fname_cached = prpsinfo_fname;
 		}
 		if (found_prstatus) {
 			/*
@@ -1005,10 +1141,8 @@ out:
 	return NULL;
 
 err:
-	if (prog->flags & DRGN_PROGRAM_IS_LINUX_KERNEL)
-		drgn_prstatus_vector_deinit(&prog->prstatus_vector);
-	else
-		drgn_thread_set_deinit(&prog->thread_set);
+	drgn_thread_set_deinit(&prog->thread_set);
+	drgn_thread_set_init(&prog->thread_set);
 	return err;
 }
 
@@ -1025,7 +1159,7 @@ drgn_thread_iterator_init_linux_kernel(struct drgn_thread_iterator *it)
 }
 
 static struct drgn_error *
-drgn_thread_iterator_init_userspace_live(struct drgn_thread_iterator *it)
+drgn_thread_iterator_init_userspace_process(struct drgn_thread_iterator *it)
 {
 #define FORMAT "/proc/%ld/task"
 	char path[sizeof(FORMAT)
@@ -1045,7 +1179,7 @@ drgn_thread_iterator_init_userspace_live(struct drgn_thread_iterator *it)
 static struct drgn_error *
 drgn_thread_iterator_init_userspace_core(struct drgn_thread_iterator *it)
 {
-	struct drgn_error *err = drgn_program_cache_core_dump_notes(it->prog);
+	struct drgn_error *err = drgn_program_cache_core_dump_threads(it->prog);
 	if (err)
 		return err;
 	it->iterator = drgn_thread_set_first(&it->prog->thread_set);
@@ -1064,10 +1198,12 @@ drgn_thread_iterator_create(struct drgn_program *prog,
 	(*ret)->prog = prog;
 	if (prog->flags & DRGN_PROGRAM_IS_LINUX_KERNEL)
 		err = drgn_thread_iterator_init_linux_kernel(*ret);
-	else if (prog->flags & DRGN_PROGRAM_IS_LIVE)
-		err = drgn_thread_iterator_init_userspace_live(*ret);
-	else
+	else if (drgn_program_is_userspace_process(prog))
+		err = drgn_thread_iterator_init_userspace_process(*ret);
+	else if (drgn_program_is_userspace_core(prog))
 		err = drgn_thread_iterator_init_userspace_core(*ret);
+	else
+		err = NULL;
 	if (err)
 		free(*ret);
 	return err;
@@ -1080,7 +1216,7 @@ drgn_thread_iterator_destroy(struct drgn_thread_iterator *it)
 		if (it->prog->flags & DRGN_PROGRAM_IS_LINUX_KERNEL) {
 			drgn_object_deinit(&it->entry.object);
 			linux_helper_task_iterator_deinit(&it->task_iter);
-		} else if (it->prog->flags & DRGN_PROGRAM_IS_LIVE) {
+		} else if (drgn_program_is_userspace_process(it->prog)) {
 			closedir(it->tasks_dir);
 		}
 		free(it);
@@ -1114,8 +1250,8 @@ drgn_thread_iterator_next_linux_kernel(struct drgn_thread_iterator *it,
 }
 
 static struct drgn_error *
-drgn_thread_iterator_next_userspace_live(struct drgn_thread_iterator *it,
-					 struct drgn_thread **ret)
+drgn_thread_iterator_next_userspace_process(struct drgn_thread_iterator *it,
+					    struct drgn_thread **ret)
 {
 	struct dirent *task;
 	unsigned long tid;
@@ -1159,10 +1295,13 @@ drgn_thread_iterator_next(struct drgn_thread_iterator *it,
 {
 	if (it->prog->flags & DRGN_PROGRAM_IS_LINUX_KERNEL) {
 		return drgn_thread_iterator_next_linux_kernel(it, ret);
-	} else if (it->prog->flags & DRGN_PROGRAM_IS_LIVE) {
-		return drgn_thread_iterator_next_userspace_live(it, ret);
-	} else {
+	} else if (drgn_program_is_userspace_process(it->prog)) {
+		return drgn_thread_iterator_next_userspace_process(it, ret);
+	} else if (drgn_program_is_userspace_core(it->prog)) {
 		drgn_thread_iterator_next_userspace_core(it, ret);
+		return NULL;
+	} else {
+		*ret = NULL;
 		return NULL;
 	}
 }
@@ -1208,8 +1347,9 @@ err:
 }
 
 static struct drgn_error *
-drgn_program_find_thread_userspace_live(struct drgn_program *prog, uint32_t tid,
-					struct drgn_thread **ret)
+drgn_program_find_thread_userspace_process(struct drgn_program *prog,
+					   uint32_t tid,
+					   struct drgn_thread **ret)
 {
 #define FORMAT "/proc/%ld/task/%" PRIu32
 	char path[sizeof(FORMAT)
@@ -1240,7 +1380,7 @@ static struct drgn_error *
 drgn_program_find_thread_userspace_core(struct drgn_program *prog, uint32_t tid,
 					struct drgn_thread **ret)
 {
-	struct drgn_error *err = drgn_program_cache_core_dump_notes(prog);
+	struct drgn_error *err = drgn_program_cache_core_dump_threads(prog);
 	if (err)
 		return err;
 	*ret = drgn_thread_set_search(&prog->thread_set, &tid).entry;
@@ -1251,12 +1391,17 @@ LIBDRGN_PUBLIC struct drgn_error *
 drgn_program_find_thread(struct drgn_program *prog, uint32_t tid,
 			 struct drgn_thread **ret)
 {
-	if (prog->flags & DRGN_PROGRAM_IS_LINUX_KERNEL)
+	if (prog->flags & DRGN_PROGRAM_IS_LINUX_KERNEL) {
 		return drgn_program_find_thread_linux_kernel(prog, tid, ret);
-	else if (prog->flags & DRGN_PROGRAM_IS_LIVE)
-		return drgn_program_find_thread_userspace_live(prog, tid, ret);
-	else
+	} else if (drgn_program_is_userspace_process(prog)) {
+		return drgn_program_find_thread_userspace_process(prog, tid,
+								  ret);
+	} else if (drgn_program_is_userspace_core(prog)) {
 		return drgn_program_find_thread_userspace_core(prog, tid, ret);
+	} else {
+		*ret = NULL;
+		return NULL;
+	}
 }
 
 // Get the CPU that crashed in a Linux kernel core dump.
@@ -1337,6 +1482,7 @@ drgn_program_find_thread_kernel_cpu_curr(struct drgn_program *prog,
 	if (err)
 		goto out;
 	thread->tid = tid.uvalue;
+	thread->prstatus = (struct nstring){};
 
 	*ret = thread;
 
@@ -1355,7 +1501,6 @@ drgn_program_kernel_core_dump_cache_crashed_thread(struct drgn_program *prog)
 
 	assert((prog->flags & DRGN_PROGRAM_IS_LINUX_KERNEL) &&
 	       !(prog->flags & DRGN_PROGRAM_IS_LIVE));
-	assert(prog->core_dump_notes_cached);
 	if (prog->crashed_thread)
 		return NULL;
 
@@ -1364,17 +1509,12 @@ drgn_program_kernel_core_dump_cache_crashed_thread(struct drgn_program *prog)
 	if (err)
 		return err;
 
-	if (crashed_cpu >= drgn_prstatus_vector_size(&prog->prstatus_vector))
-		return NULL;
-
 	err = drgn_program_find_thread_kernel_cpu_curr(prog, crashed_cpu,
 						       &prog->crashed_thread);
 	if (err) {
 		prog->crashed_thread = NULL;
 		return err;
 	}
-	prog->crashed_thread->prstatus =
-		*drgn_prstatus_vector_at(&prog->prstatus_vector, crashed_cpu);
 	return NULL;
 }
 
@@ -1387,7 +1527,7 @@ drgn_program_main_thread(struct drgn_program *prog, struct drgn_thread **ret)
 		return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
 					 "main thread is not defined for the Linux kernel");
 	}
-	if (prog->flags & DRGN_PROGRAM_IS_LIVE) {
+	if (drgn_program_is_userspace_process(prog)) {
 		if (!prog->main_thread) {
 			err = drgn_program_find_thread(prog, prog->pid,
 						       &prog->main_thread);
@@ -1396,8 +1536,8 @@ drgn_program_main_thread(struct drgn_program *prog, struct drgn_thread **ret)
 				return err;
 			}
 		}
-	} else {
-		err = drgn_program_cache_core_dump_notes(prog);
+	} else if (drgn_program_is_userspace_core(prog)) {
+		err = drgn_program_cache_core_dump_threads(prog);
 		if (err)
 			return err;
 	}
@@ -1418,14 +1558,14 @@ drgn_program_crashed_thread(struct drgn_program *prog, struct drgn_thread **ret)
 		return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
 					 "crashed thread is only defined for core dumps");
 	}
-	err = drgn_program_cache_core_dump_notes(prog);
+	if (prog->flags & DRGN_PROGRAM_IS_LINUX_KERNEL)
+		err = drgn_program_kernel_core_dump_cache_crashed_thread(prog);
+	else if (drgn_program_is_userspace_core(prog))
+		err = drgn_program_cache_core_dump_threads(prog);
+	else
+		err = NULL;
 	if (err)
 		return err;
-	if (prog->flags & DRGN_PROGRAM_IS_LINUX_KERNEL) {
-		err = drgn_program_kernel_core_dump_cache_crashed_thread(prog);
-		if (err)
-			return err;
-	}
 	if (!prog->crashed_thread) {
 		return drgn_error_create(DRGN_ERROR_OTHER,
 					 "crashed thread not found");
@@ -1445,36 +1585,89 @@ drgn_thread_object(struct drgn_thread *thread, const struct drgn_object **ret)
 	return NULL;
 }
 
-struct drgn_error *drgn_program_find_prstatus_by_cpu(struct drgn_program *prog,
-						     uint32_t cpu,
-						     struct nstring *ret)
+static struct drgn_error *
+drgn_thread_name_linux_kernel(struct drgn_thread *thread, char **ret)
 {
-	assert(prog->flags & DRGN_PROGRAM_IS_LINUX_KERNEL);
-	struct drgn_error *err = drgn_program_cache_core_dump_notes(prog);
+	struct drgn_error *err;
+	DRGN_OBJECT(comm, drgn_object_program(&thread->object));
+	err = drgn_object_member_dereference(&comm, &thread->object, "comm");
+	if (!err)
+		err = drgn_object_read_c_string(&comm, ret);
+	return err;
+}
+
+static struct drgn_error *
+drgn_thread_name_userspace_process(struct drgn_thread *thread, char **ret)
+{
+#define FORMAT "/proc/%" PRIu32 "/comm"
+	char path[sizeof(FORMAT)
+		- sizeof("%" PRIu32)
+		+ max_decimal_length(uint32_t)
+		+ 1];
+	snprintf(path, sizeof(path), FORMAT, thread->tid);
+#undef FORMAT
+	_cleanup_close_ int fd = open(path, O_RDONLY);
+	if (fd < 0)
+		return drgn_error_create_os("open", errno, path);
+	// While userspace threads use 16 byte buffer, kernel threads use a 64 byte buffer
+	// https://github.com/torvalds/linux/blob/075dbe9f6e3c21596c5245826a4ee1f1c1676eb8/fs/proc/array.c#L101
+	char buf[64];
+	ssize_t bytes_read = read_all(fd, buf, sizeof(buf));
+	if (bytes_read < 0)
+		return drgn_error_create_os("read", errno, path);
+
+	if (bytes_read > 0 && buf[bytes_read - 1] == '\n')
+		bytes_read--;
+	char *tmp = strndup(buf, bytes_read);
+	if (!tmp)
+		return &drgn_enomem;
+	*ret = tmp;
+	return NULL;
+}
+
+static struct drgn_error *
+drgn_thread_name_userspace_core(struct drgn_thread *thread, char **ret)
+{
+	struct drgn_error *err = drgn_program_cache_core_dump_threads(thread->prog);
 	if (err)
 		return err;
-
-	if (cpu < drgn_prstatus_vector_size(&prog->prstatus_vector)) {
-		*ret = *drgn_prstatus_vector_at(&prog->prstatus_vector, cpu);
+	// Core dumps only contain the main thread name so check if this is the main thread.
+	// Otherwise, set ret to NULL which will return None in Python.
+	bool is_main_thread = thread->prog->main_thread && thread->prog->main_thread->tid == thread->tid;
+	if (is_main_thread && thread->prog->core_dump_fname_cached) {
+		char *tmp = strdup(thread->prog->core_dump_fname_cached);
+		if (!tmp)
+			return &drgn_enomem;
+		*ret = tmp;
 	} else {
-		ret->str = NULL;
-		ret->len = 0;
+		*ret = NULL;
 	}
 	return NULL;
 }
 
-struct drgn_error *drgn_program_find_prstatus_by_tid(struct drgn_program *prog,
-						     uint32_t tid,
-						     struct nstring *ret)
+LIBDRGN_PUBLIC struct drgn_error *
+drgn_thread_name(struct drgn_thread *thread, char **ret)
 {
-	struct drgn_error *err;
+	if (thread->prog->flags & DRGN_PROGRAM_IS_LINUX_KERNEL) {
+		return drgn_thread_name_linux_kernel(thread, ret);
+	} else if (drgn_program_is_userspace_process(thread->prog)) {
+		return drgn_thread_name_userspace_process(thread, ret);
+	} else if (drgn_program_is_userspace_core(thread->prog)) {
+		return drgn_thread_name_userspace_core(thread, ret);
+	} else {
+		*ret = NULL;
+		return NULL;
+	}
+}
 
-	assert(!(prog->flags & DRGN_PROGRAM_IS_LINUX_KERNEL));
-	struct drgn_thread *thread;
-	err = drgn_program_find_thread(prog, tid, &thread);
+struct drgn_error *drgn_program_find_prstatus(struct drgn_program *prog,
+					      uint32_t tid, struct nstring *ret)
+{
+	struct drgn_error *err = drgn_program_cache_core_dump_threads(prog);
 	if (err)
 		return err;
-
+	struct drgn_thread *thread =
+		drgn_thread_set_search(&prog->thread_set, &tid).entry;
 	if (!thread) {
 		ret->str = NULL;
 		ret->len = 0;
@@ -1762,33 +1955,50 @@ drgn_program_find_object(struct drgn_program *prog, const char *name,
 			 enum drgn_find_object_flags flags,
 			 struct drgn_object *ret)
 {
+	struct drgn_error *err;
+
+	if ((flags & ~DRGN_FIND_OBJECT_ANY) || !flags) {
+		return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
+					 "invalid find object flags");
+	}
 	if (ret && drgn_object_program(ret) != prog) {
 		return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
 					 "object is from wrong program");
 	}
-	return drgn_object_index_find(&prog->oindex, name, filename, flags,
-				      ret);
-}
 
-bool drgn_program_find_symbol_by_address_internal(struct drgn_program *prog,
-						  uint64_t address,
-						  Dwfl_Module *module,
-						  struct drgn_symbol *ret)
-{
-	if (!module) {
-		module = dwfl_addrmodule(prog->dbinfo.dwfl, address);
-		if (!module)
-			return false;
+	size_t name_len = strlen(name);
+	drgn_handler_list_for_each_enabled(struct drgn_object_finder, finder,
+					   &prog->object_finders) {
+		err = finder->ops.find(name, name_len, filename, flags,
+				       finder->arg, ret);
+		if (err != &drgn_not_found)
+			return err;
 	}
 
-	GElf_Off offset;
-	GElf_Sym elf_sym;
-	const char *name = dwfl_module_addrinfo(module, address, &offset,
-						&elf_sym, NULL, NULL, NULL);
-	if (!name)
-		return false;
-	drgn_symbol_from_elf(name, address - offset, &elf_sym, ret);
-	return true;
+	const char *kind_str;
+	switch (flags) {
+	case DRGN_FIND_OBJECT_CONSTANT:
+		kind_str = "constant ";
+		break;
+	case DRGN_FIND_OBJECT_FUNCTION:
+		kind_str = "function ";
+		break;
+	case DRGN_FIND_OBJECT_VARIABLE:
+		kind_str = "variable ";
+		break;
+	default:
+		kind_str = "";
+		break;
+	}
+	if (filename) {
+		return drgn_error_format(DRGN_ERROR_LOOKUP,
+					 "could not find %s'%s' in '%s'",
+					 kind_str, name, filename);
+	} else {
+		return drgn_error_format(DRGN_ERROR_LOOKUP,
+					 "could not find %s'%s'", kind_str,
+					 name);
+	}
 }
 
 struct drgn_error *drgn_error_symbol_not_found(uint64_t address)
@@ -1798,115 +2008,19 @@ struct drgn_error *drgn_error_symbol_not_found(uint64_t address)
 				 address);
 }
 
-LIBDRGN_PUBLIC struct drgn_error *
-drgn_program_find_symbol_by_address(struct drgn_program *prog, uint64_t address,
-				    struct drgn_symbol **ret)
-{
-	struct drgn_symbol *sym;
-
-	sym = malloc(sizeof(*sym));
-	if (!sym)
-		return &drgn_enomem;
-	if (!drgn_program_find_symbol_by_address_internal(prog, address, NULL,
-							  sym)) {
-		free(sym);
-		return drgn_error_symbol_not_found(address);
-	}
-	*ret = sym;
-	return NULL;
-}
-
-DEFINE_VECTOR(symbolp_vector, struct drgn_symbol *);
-
-enum {
-	SYMBOLS_SEARCH_NAME = (1 << 0),
-	SYMBOLS_SEARCH_ADDRESS = (1 << 1),
-	SYMBOLS_SEARCH_ALL = (1 << 2),
-};
-
-struct symbols_search_arg {
-	const char *name;
-	uint64_t address;
-	struct symbolp_vector results;
-	unsigned int flags;
-};
-
-static bool symbol_match(struct symbols_search_arg *arg, GElf_Addr addr,
-			 const GElf_Sym *sym, const char *name)
-{
-	if (arg->flags & SYMBOLS_SEARCH_ALL)
-		return true;
-	if ((arg->flags & SYMBOLS_SEARCH_NAME) && strcmp(name, arg->name) == 0)
-		return true;
-	if ((arg->flags & SYMBOLS_SEARCH_ADDRESS) &&
-	    arg->address >= addr && arg->address < addr + sym->st_size)
-		return true;
-	return false;
-}
-
-static int symbols_search_cb(Dwfl_Module *dwfl_module, void **userdatap,
-			     const char *module_name, Dwarf_Addr base,
-			     void *cb_arg)
-{
-	struct symbols_search_arg *arg = cb_arg;
-
-	int symtab_len = dwfl_module_getsymtab(dwfl_module);
-	if (symtab_len == -1)
-		return DWARF_CB_OK;
-
-	/* Ignore the zeroth null symbol */
-	for (int i = 1; i < symtab_len; i++) {
-		GElf_Sym elf_sym;
-		GElf_Addr elf_addr;
-		const char *name = dwfl_module_getsym_info(dwfl_module, i,
-							   &elf_sym, &elf_addr,
-							   NULL, NULL, NULL);
-		if (!name || !symbol_match(arg, elf_addr, &elf_sym, name))
-			continue;
-
-		struct drgn_symbol *sym = malloc(sizeof(*sym));
-		if (!sym)
-			return DWARF_CB_ABORT;
-		drgn_symbol_from_elf(name, elf_addr, &elf_sym, sym);
-		if (!symbolp_vector_append(&arg->results, &sym)) {
-			drgn_symbol_destroy(sym);
-			return DWARF_CB_ABORT;
-		}
-	}
-	return DWARF_CB_OK;
-}
-
 static struct drgn_error *
-symbols_search(struct drgn_program *prog, struct symbols_search_arg *arg,
-	       struct drgn_symbol ***syms_ret, size_t *count_ret)
+drgn_program_symbols_search(struct drgn_program *prog, const char *name,
+			    uint64_t addr, enum drgn_find_symbol_flags flags,
+			    struct drgn_symbol_result_builder *builder)
 {
-	struct drgn_error *err;
-
-	symbolp_vector_init(&arg->results);
-
-	/*
-	 * When searching for addresses, we can identify the exact module to
-	 * search. Otherwise we need to fall back to an exhaustive search.
-	 */
-	err = NULL;
-	if (arg->flags & SYMBOLS_SEARCH_ADDRESS) {
-		Dwfl_Module *module = dwfl_addrmodule(prog->dbinfo.dwfl,
-						      arg->address);
-		if (module && symbols_search_cb(module, NULL, NULL, 0, arg))
-			err = &drgn_enomem;
-	} else {
-		if (dwfl_getmodules(prog->dbinfo.dwfl, symbols_search_cb, arg,
-				    0))
-			err = &drgn_enomem;
-	}
-
-	if (err) {
-		vector_for_each(symbolp_vector, symbolp, &arg->results)
-			drgn_symbol_destroy(*symbolp);
-		symbolp_vector_deinit(&arg->results);
-	} else {
-		symbolp_vector_shrink_to_fit(&arg->results);
-		symbolp_vector_steal(&arg->results, syms_ret, count_ret);
+	struct drgn_error *err = NULL;
+	drgn_handler_list_for_each_enabled(struct drgn_symbol_finder, finder,
+					   &prog->symbol_finders) {
+		err = finder->ops.find(name, addr, flags, finder->arg, builder);
+		if (err ||
+		    ((flags & DRGN_FIND_SYMBOL_ONE)
+		     && drgn_symbol_result_builder_count(builder) > 0))
+			break;
 	}
 	return err;
 }
@@ -1916,11 +2030,17 @@ drgn_program_find_symbols_by_name(struct drgn_program *prog, const char *name,
 				  struct drgn_symbol ***syms_ret,
 				  size_t *count_ret)
 {
-	struct symbols_search_arg arg = {
-		.name = name,
-		.flags = name ? SYMBOLS_SEARCH_NAME : SYMBOLS_SEARCH_ALL,
-	};
-	return symbols_search(prog, &arg, syms_ret, count_ret);
+	struct drgn_symbol_result_builder builder;
+	enum drgn_find_symbol_flags flags = name ? DRGN_FIND_SYMBOL_NAME : 0;
+
+	drgn_symbol_result_builder_init(&builder, false);
+	struct drgn_error *err = drgn_program_symbols_search(prog, name, 0,
+							     flags, &builder);
+	if (err)
+		drgn_symbol_result_builder_abort(&builder);
+	else
+		drgn_symbol_result_builder_array(&builder, syms_ret, count_ret);
+	return err;
 }
 
 LIBDRGN_PUBLIC struct drgn_error *
@@ -1929,88 +2049,81 @@ drgn_program_find_symbols_by_address(struct drgn_program *prog,
 				     struct drgn_symbol ***syms_ret,
 				     size_t *count_ret)
 {
-	struct symbols_search_arg arg = {
-		.address = address,
-		.flags = SYMBOLS_SEARCH_ADDRESS,
-	};
-	return symbols_search(prog, &arg, syms_ret, count_ret);
-}
+	struct drgn_symbol_result_builder builder;
+	enum drgn_find_symbol_flags flags = DRGN_FIND_SYMBOL_ADDR;
 
-struct find_symbol_by_name_arg {
-	const char *name;
-	GElf_Sym sym;
-	GElf_Addr addr;
-	bool found;
-	bool bad_symtabs;
-};
-
-static int find_symbol_by_name_cb(Dwfl_Module *dwfl_module, void **userdatap,
-				  const char *module_name, Dwarf_Addr base,
-				  void *cb_arg)
-{
-	struct find_symbol_by_name_arg *arg = cb_arg;
-	int symtab_len = dwfl_module_getsymtab(dwfl_module);
-	if (symtab_len == -1) {
-		arg->bad_symtabs = true;
-		return DWARF_CB_OK;
-	}
-	/*
-	 * Global symbols are after local symbols, so by iterating backwards we
-	 * might find a global symbol faster. Ignore the zeroth null symbol.
-	 */
-	for (int i = symtab_len - 1; i > 0; i--) {
-		GElf_Sym sym;
-		GElf_Addr addr;
-		const char *name = dwfl_module_getsym_info(dwfl_module, i, &sym,
-							   &addr, NULL, NULL,
-							   NULL);
-		if (name && strcmp(arg->name, name) == 0) {
-			/*
-			 * The order of precedence is
-			 * GLOBAL = GNU_UNIQUE > WEAK > LOCAL = everything else
-			 *
-			 * If we found a global or unique symbol, return it
-			 * immediately. If we found a weak symbol, then save it,
-			 * which may overwrite a previously found weak or local
-			 * symbol. Otherwise, save the symbol only if we haven't
-			 * found another symbol.
-			 */
-			if (GELF_ST_BIND(sym.st_info) == STB_GLOBAL ||
-			    GELF_ST_BIND(sym.st_info) == STB_GNU_UNIQUE ||
-			    GELF_ST_BIND(sym.st_info) == STB_WEAK ||
-			    !arg->found) {
-				arg->sym = sym;
-				arg->addr = addr;
-				arg->found = true;
-			}
-			if (GELF_ST_BIND(sym.st_info) == STB_GLOBAL ||
-			    GELF_ST_BIND(sym.st_info) == STB_GNU_UNIQUE)
-				return DWARF_CB_ABORT;
-		}
-	}
-	return DWARF_CB_OK;
+	drgn_symbol_result_builder_init(&builder, false);
+	struct drgn_error *err = drgn_program_symbols_search(prog, NULL, address,
+							     flags, &builder);
+	if (err)
+		drgn_symbol_result_builder_abort(&builder);
+	else
+		drgn_symbol_result_builder_array(&builder, syms_ret, count_ret);
+	return err;
 }
 
 LIBDRGN_PUBLIC struct drgn_error *
 drgn_program_find_symbol_by_name(struct drgn_program *prog,
-			const char *name, struct drgn_symbol **ret)
+				 const char *name, struct drgn_symbol **ret)
 {
-	struct find_symbol_by_name_arg arg = {
-		.name = name,
-	};
-	dwfl_getmodules(prog->dbinfo.dwfl, find_symbol_by_name_cb, &arg, 0);
-	if (arg.found) {
-		struct drgn_symbol *sym = malloc(sizeof(*sym));
-		if (!sym)
-			return &drgn_enomem;
-		drgn_symbol_from_elf(name, arg.addr, &arg.sym, sym);
-		*ret = sym;
-		return NULL;
+	struct drgn_symbol_result_builder builder;
+	enum drgn_find_symbol_flags flags = DRGN_FIND_SYMBOL_NAME | DRGN_FIND_SYMBOL_ONE;
+
+	drgn_symbol_result_builder_init(&builder, true);
+	struct drgn_error *err = drgn_program_symbols_search(prog, name, 0,
+							     flags, &builder);
+	if (err) {
+		drgn_symbol_result_builder_abort(&builder);
+		return err;
 	}
-	return drgn_error_format(DRGN_ERROR_LOOKUP,
-				 "could not find symbol with name '%s'%s", name,
-				 arg.bad_symtabs ?
-				 " (could not get some symbol tables)" : "");
+
+	if (!drgn_symbol_result_builder_count(&builder))
+		return drgn_error_format(DRGN_ERROR_LOOKUP,
+					 "could not find symbol with name '%s'", name);
+
+	*ret = drgn_symbol_result_builder_single(&builder);
+	return err;
+}
+
+LIBDRGN_PUBLIC struct drgn_error *
+drgn_program_find_symbol_by_address(struct drgn_program *prog, uint64_t address,
+				    struct drgn_symbol **ret)
+{
+	struct drgn_symbol_result_builder builder;
+	enum drgn_find_symbol_flags flags = DRGN_FIND_SYMBOL_ADDR | DRGN_FIND_SYMBOL_ONE;
+
+	drgn_symbol_result_builder_init(&builder, true);
+	struct drgn_error *err = drgn_program_symbols_search(prog, NULL, address,
+							     flags, &builder);
+
+	if (err) {
+		drgn_symbol_result_builder_abort(&builder);
+		return err;
+	}
+
+	if (!drgn_symbol_result_builder_count(&builder))
+		return drgn_error_symbol_not_found(address);
+
+	*ret = drgn_symbol_result_builder_single(&builder);
+	return err;
+}
+
+struct drgn_error *
+drgn_program_find_symbol_by_address_internal(struct drgn_program *prog,
+					     uint64_t address,
+					     struct drgn_symbol **ret)
+{
+	struct drgn_symbol_result_builder builder;
+	enum drgn_find_symbol_flags flags = DRGN_FIND_SYMBOL_ADDR | DRGN_FIND_SYMBOL_ONE;
+
+	drgn_symbol_result_builder_init(&builder, true);
+	struct drgn_error *err = drgn_program_symbols_search(prog, NULL, address,
+							     flags, &builder);
+	if (err)
+		drgn_symbol_result_builder_abort(&builder);
+	else
+		*ret = drgn_symbol_result_builder_single(&builder);
+	return err;
 }
 
 LIBDRGN_PUBLIC struct drgn_error *

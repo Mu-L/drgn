@@ -18,6 +18,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define _unused_ __attribute__((__unused__))
+
 #ifndef LIBDRGN_PUBLIC
 #define LIBDRGN_PUBLIC __attribute__((__visibility__("default")))
 #endif
@@ -39,28 +41,18 @@
 /**
  * Switch statement with an enum controlling expression that must have a case
  * for every enumeration value and a default case.
+ *
+ * m4/my_c_switch_enum.m4 checks whether this works and defines a stub version
+ * if not. Keep this definition in sync with the check.
  */
-#define SWITCH_ENUM_DEFAULT(expr, ...) {			\
-	_Pragma("GCC diagnostic push");				\
-	_Pragma("GCC diagnostic error \"-Wswitch-enum\"");	\
-	_Pragma("GCC diagnostic error \"-Wswitch-default\"");	\
-	switch (expr)  {					\
-	__VA_ARGS__						\
-	}							\
-	_Pragma("GCC diagnostic pop");				\
-}
-
-/**
- * Switch statement with an enum controlling expression that must have a case
- * for every enumeration value. The expression is assumed to have a valid
- * enumeration value. Cases which are assumed not to be possible can be placed
- * at the end of the statement.
- */
-#define SWITCH_ENUM(expr, ...)		\
-	SWITCH_ENUM_DEFAULT(expr,	\
-	__VA_ARGS__			\
-	default: UNREACHABLE();		\
-	)
+#ifndef SWITCH_ENUM
+#define SWITCH_ENUM(expr)					\
+	_Pragma("GCC diagnostic push")				\
+	_Pragma("GCC diagnostic error \"-Wswitch-enum\"")	\
+	_Pragma("GCC diagnostic error \"-Wswitch-default\"")	\
+	switch (expr)						\
+	_Pragma("GCC diagnostic pop")
+#endif
 
 #define likely(x) __builtin_expect(!!(x), 1)
 #define unlikely(x) __builtin_expect(!!(x), 0)
@@ -78,6 +70,10 @@
 #define static_assert_expression(assert_expression, message, eval_expression)	\
 	_Generic(sizeof(struct { _Static_assert(assert_expression, message); int _; }),\
 		 default: (eval_expression))
+
+#define sizeof_member(type, member) sizeof(((type *)0)->member)
+
+#define typeof_member(type, member) typeof(((type *)0)->member)
 
 #define container_of(ptr, type, member)				\
 static_assert_expression(					\
@@ -220,5 +216,20 @@ static inline uint64_t uint_max(int n)
  */
 #define add_to_possibly_null_pointer(ptr, i)	\
 	((typeof(ptr))((uintptr_t)(ptr) + (i) * sizeof(*(ptr))))
+
+/**
+ * Similar to qsort_r (passes @a arg to @a compar) but **not** reentrant
+ *
+ * The qsort_r() function's main feature is that it is reentrant, but also adds
+ * the convenience of including an argument to the callback function.
+ * Unfortunately it is a glibc extension. This provides a similar API but it is
+ * only thread-safe, not reentrant. See qsort_r(3) for details.
+ */
+void qsort_arg(void *base, size_t nmemb, size_t size,
+	       int (*compar)(const void *, const void *, void*), void *arg);
+
+struct uint64_range {
+	uint64_t start, end;
+};
 
 #endif /* DRGN_UTIL_H */

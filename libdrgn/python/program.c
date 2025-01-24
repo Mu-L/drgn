@@ -5,15 +5,18 @@
 #include "../bitops.h"
 #include "../error.h"
 #include "../hash_table.h"
+#include "../linux_kernel.h"
 #include "../log.h"
 #include "../program.h"
 #include "../string_builder.h"
+#include "../symbol.h"
 #include "../util.h"
 #include "../vector.h"
 
 DEFINE_HASH_SET_FUNCTIONS(pyobjectp_set, ptr_key_hash_pair, scalar_key_eq);
 
 static PyObject *percent_s;
+static PyObject *logging_StreamHandler;
 static PyObject *logger;
 static PyObject *logger_log;
 
@@ -38,7 +41,7 @@ static void drgnpy_log_fn(struct drgn_program *prog, void *arg,
 		PyErr_WriteUnraisable(logger_log);
 }
 
-static int get_log_level(void)
+static int get_logging_status(int *log_level_ret, bool *enable_progress_bar_ret)
 {
 	// We don't use getEffectiveLevel() because that doesn't take
 	// logging.disable() into account.
@@ -55,38 +58,128 @@ static int get_log_level(void)
 		if (ret)
 			break;
 	}
-	return level;
+
+	*log_level_ret = level;
+
+	if (level > DRGN_LOG_WARNING || !isatty(STDERR_FILENO)) {
+		*enable_progress_bar_ret = false;
+		return 0;
+	}
+
+	PyObject *current_logger = logger;
+	_cleanup_pydecref_ PyObject *logger_to_decref = NULL;
+	do {
+		_cleanup_pydecref_ PyObject *handlers =
+			PyObject_GetAttrString(current_logger, "handlers");
+		if (!handlers)
+			return -1;
+
+		Py_ssize_t size = PySequence_Size(handlers);
+		if (size < 0)
+			return -1;
+
+		for (Py_ssize_t i = 0; i < size; i++) {
+			_cleanup_pydecref_ PyObject *handler =
+				PySequence_GetItem(handlers, i);
+			if (!handler)
+				return -1;
+
+			int r = PyObject_IsInstance(handler,
+						    logging_StreamHandler);
+			if (r < 0)
+				return -1;
+			if (!r)
+				continue;
+
+			_cleanup_pydecref_ PyObject *stream =
+				PyObject_GetAttrString(handler, "stream");
+			if (!stream)
+				return -1;
+
+			_cleanup_pydecref_ PyObject *fd_obj =
+				PyObject_CallMethod(stream, "fileno", NULL);
+			if (!fd_obj) {
+				// Ignore AttributeError,
+				// io.UnsupportedOperation, etc.
+				if (PyErr_ExceptionMatches(PyExc_Exception)) {
+					PyErr_Clear();
+					continue;
+				} else {
+					return -1;
+				}
+			}
+
+			long fd = PyLong_AsLong(fd_obj);
+			if (fd == -1 && PyErr_Occurred())
+				return -1;
+
+			if (fd == STDERR_FILENO) {
+				*enable_progress_bar_ret = true;
+				return 0;
+			}
+		}
+
+		_cleanup_pydecref_ PyObject *propagate =
+			PyObject_GetAttrString(current_logger, "propagate");
+		if (!propagate)
+			return -1;
+		int ret = PyObject_IsTrue(propagate);
+		if (ret < 0)
+			return -1;
+		if (!ret)
+			break;
+
+		Py_XDECREF(logger_to_decref);
+		logger_to_decref = PyObject_GetAttrString(current_logger,
+							  "parent");
+		if (!logger_to_decref)
+			return -1;
+		current_logger = logger_to_decref;
+	} while (current_logger != Py_None);
+
+	*enable_progress_bar_ret = false;
+	return 0;
 }
 
-// This is slightly heinous. We need to sync the Python log level with the
-// libdrgn log level, but the Python log level can change at any time, and there
-// is no API to be notified of this. So, we monkey patch logger._cache.clear()
-// to update the log level on every live program. This only works since CPython
-// commit 78c18a9b9a14 ("bpo-30962: Added caching to Logger.isEnabledFor()
-// (GH-2752)") (in v3.7), though. Before that, the best we can do is sync the
-// level at the time that the program is created.
+// This is slightly heinous. We need to sync the Python logging configuration
+// with libdrgn, but the Python log level and handlers can change at any time,
+// and there are no APIs to be notified of this.
+//
+// To sync the log level, we monkey patch logger._cache.clear() to update the
+// libdrgn log level on every live program. This only works since CPython commit
+// 78c18a9b9a14 ("bpo-30962: Added caching to Logger.isEnabledFor() (GH-2752)")
+// (in v3.7), though. Before that, the best we can do is sync the level at the
+// time that the program is created.
+//
+// We also check handlers in that monkey patch, which isn't the right place to
+// hook but should work in practice in most cases.
 #if PY_VERSION_HEX >= 0x030700a1
 static int cached_log_level;
+static bool cached_enable_progress_bar;
 static struct pyobjectp_set programs = HASH_TABLE_INIT;
 
-static int cache_log_level(void)
+static int cache_logging_status(void)
 {
-	int level = get_log_level();
-	if (level < 0)
-		return level;
-	cached_log_level = level;
-	return 0;
+	return get_logging_status(&cached_log_level,
+				  &cached_enable_progress_bar);
 }
 
 static PyObject *LoggerCacheWrapper_clear(PyObject *self)
 {
 	PyDict_Clear(self);
-	if (cache_log_level())
-		return NULL;
-	for (struct pyobjectp_set_iterator it = pyobjectp_set_first(&programs);
-	     it.entry; it = pyobjectp_set_next(it)) {
-		Program *prog = (Program *)*it.entry;
-		drgn_program_set_log_level(&prog->prog, cached_log_level);
+	if (!pyobjectp_set_empty(&programs)) {
+		if (cache_logging_status())
+			return NULL;
+		for (struct pyobjectp_set_iterator it =
+		     pyobjectp_set_first(&programs);
+		     it.entry; it = pyobjectp_set_next(it)) {
+			Program *prog = (Program *)*it.entry;
+			drgn_program_set_log_level(&prog->prog,
+						   cached_log_level);
+			drgn_program_set_progress_file(&prog->prog,
+						       cached_enable_progress_bar
+						       ? stderr : NULL);
+		}
 	}
 	Py_RETURN_NONE;
 }
@@ -112,19 +205,23 @@ static int init_logger_cache_wrapper(void)
 				      NULL);
 	if (!cache_wrapper)
 		return -1;
-	if (PyObject_SetAttrString(logger, "_cache", cache_wrapper))
-		return -1;
-
-	return cache_log_level();
+	return PyObject_SetAttrString(logger, "_cache", cache_wrapper);
 }
 
 static int Program_init_logging(Program *prog)
 {
+	// The cache is only maintained while there are live programs, so if
+	// this is the only program, we need to update the cache.
+	if (pyobjectp_set_empty(&programs) && cache_logging_status())
+		return -1;
+
 	PyObject *obj = (PyObject *)prog;
 	if (pyobjectp_set_insert(&programs, &obj, NULL) < 0)
 		return -1;
 	drgn_program_set_log_callback(&prog->prog, drgnpy_log_fn, NULL);
 	drgn_program_set_log_level(&prog->prog, cached_log_level);
+	drgn_program_set_progress_file(&prog->prog,
+				       cached_enable_progress_bar ? stderr : NULL);
 	return 0;
 }
 
@@ -138,11 +235,14 @@ static int init_logger_cache_wrapper(void) { return 0; }
 
 static int Program_init_logging(Program *prog)
 {
-	int level = get_log_level();
-	if (level < 0)
-		return level;
+	int level;
+	bool enable_progress_bar;
+	if (get_logging_status(&level, &enable_progress_bar))
+		return -1;
 	drgn_program_set_log_callback(&prog->prog, drgnpy_log_fn, NULL);
 	drgn_program_set_log_level(&prog->prog, level);
+	drgn_program_set_progress_file(&prog->prog,
+				       enable_progress_bar ? stderr : NULL);
 	return 0;
 }
 
@@ -157,6 +257,10 @@ int init_logging(void)
 
 	_cleanup_pydecref_ PyObject *logging = PyImport_ImportModule("logging");
 	if (!logging)
+		return -1;
+	logging_StreamHandler = PyObject_GetAttrString(logging,
+						       "StreamHandler");
+	if (!logging_StreamHandler)
 		return -1;
 	logger = PyObject_CallMethod(logging, "getLogger", "s", "drgn");
 	if (!logger)
@@ -174,14 +278,20 @@ int Program_hold_object(Program *prog, PyObject *obj)
 	if (ret > 0) {
 		Py_INCREF(obj);
 		ret = 0;
+	} else if (ret < 0) {
+		PyErr_NoMemory();
 	}
 	return ret;
 }
 
 bool Program_hold_reserve(Program *prog, size_t n)
 {
-	return pyobjectp_set_reserve(&prog->objects,
-				     pyobjectp_set_size(&prog->objects) + n);
+	if (!pyobjectp_set_reserve(&prog->objects,
+				   pyobjectp_set_size(&prog->objects) + n)) {
+		PyErr_NoMemory();
+		return false;
+	}
+	return true;
 }
 
 int Program_type_arg(Program *prog, PyObject *type_obj, bool can_be_none,
@@ -223,21 +333,28 @@ int Program_type_arg(Program *prog, PyObject *type_obj, bool can_be_none,
 
 static void *drgnpy_begin_blocking(struct drgn_program *prog, void *arg)
 {
-	return PyEval_SaveThread();
+	PyThreadState *state = PyThreadState_GetUnchecked();
+	if (state)
+		PyEval_ReleaseThread(state);
+	return state;
 }
 
 static void drgnpy_end_blocking(struct drgn_program *prog, void *arg, void *state)
 {
-	PyEval_RestoreThread(state);
+	if (state)
+		PyEval_RestoreThread(state);
 }
 
 static Program *Program_new(PyTypeObject *subtype, PyObject *args,
 			    PyObject *kwds)
 {
-	static char *keywords[] = { "platform", NULL };
+	static char *keywords[] = { "platform", "vmcoreinfo", NULL };
 	PyObject *platform_obj = NULL;
-	if (!PyArg_ParseTupleAndKeywords(args, kwds, "|O:Program", keywords,
-					 &platform_obj))
+	const char *vmcoreinfo = NULL;
+	Py_ssize_t vmcoreinfo_size;
+	if (!PyArg_ParseTupleAndKeywords(args, kwds, "|O$z#:Program", keywords,
+					 &platform_obj, &vmcoreinfo,
+					 &vmcoreinfo_size))
 		return NULL;
 
 	struct drgn_platform *platform;
@@ -263,6 +380,12 @@ static Program *Program_new(PyTypeObject *subtype, PyObject *args,
 	drgn_program_init(&prog->prog, platform);
 	drgn_program_set_blocking_callback(&prog->prog, drgnpy_begin_blocking,
 					   drgnpy_end_blocking, NULL);
+	if (vmcoreinfo) {
+		struct drgn_error *err = drgn_program_parse_vmcoreinfo(
+			&prog->prog, vmcoreinfo, vmcoreinfo_size);
+		if (err)
+			return set_drgn_error(err);
+	}
 	if (Program_init_logging(prog))
 		return NULL;
 	return_ptr(prog);
@@ -369,10 +492,82 @@ static PyObject *Program_add_memory_segment(Program *self, PyObject *args,
 	Py_RETURN_NONE;
 }
 
+static struct drgn_error *
+py_debug_info_find_fn(struct drgn_module * const *modules, size_t num_modules,
+		      void *arg)
+{
+	PyGILState_guard();
+
+	_cleanup_pydecref_ PyObject *modules_list = PyList_New(num_modules);
+	if (!modules_list)
+		return drgn_error_from_python();
+	for (size_t i = 0; i < num_modules; i++) {
+		PyObject *module_obj = Module_wrap(modules[i]);
+		if (!module_obj)
+			return drgn_error_from_python();
+		PyList_SET_ITEM(modules_list, i, module_obj);
+	}
+	_cleanup_pydecref_ PyObject *obj =
+		PyObject_CallOneArg(arg, modules_list);
+	if (!obj)
+		return drgn_error_from_python();
+	return NULL;
+}
+
+static inline struct drgn_error *
+py_type_find_fn_common(PyObject *type_obj, void *arg,
+		       struct drgn_qualified_type *ret)
+{
+	if (!PyObject_TypeCheck(type_obj, &DrgnType_type)) {
+		PyErr_SetString(PyExc_TypeError,
+				"type find callback must return Type or None");
+		return drgn_error_from_python();
+	}
+	// This check is also done in libdrgn, but we need it here because if
+	// the type isn't from this program, then there's no guarantee that it
+	// will remain valid after we decrement its reference count.
+	if (DrgnType_prog((DrgnType *)type_obj)
+	    != (Program *)PyTuple_GET_ITEM(arg, 0)) {
+		PyErr_SetString(PyExc_ValueError,
+				"type find callback returned type from wrong program");
+		return drgn_error_from_python();
+	}
+	ret->type = ((DrgnType *)type_obj)->type;
+	ret->qualifiers = ((DrgnType *)type_obj)->qualifiers;
+	return NULL;
+}
+
 static struct drgn_error *py_type_find_fn(uint64_t kinds, const char *name,
 					  size_t name_len, const char *filename,
 					  void *arg,
 					  struct drgn_qualified_type *ret)
+{
+	PyGILState_guard();
+
+	_cleanup_pydecref_ PyObject *name_obj =
+		PyUnicode_FromStringAndSize(name, name_len);
+	if (!name_obj)
+		return drgn_error_from_python();
+
+	_cleanup_pydecref_ PyObject *kinds_obj = TypeKindSet_wrap(kinds);
+	if (!kinds_obj)
+		return drgn_error_from_python();
+	_cleanup_pydecref_ PyObject *type_obj =
+		PyObject_CallFunction(PyTuple_GET_ITEM(arg, 1), "OOOs",
+				      PyTuple_GET_ITEM(arg, 0), kinds_obj,
+				      name_obj, filename);
+	if (!type_obj)
+		return drgn_error_from_python();
+	if (type_obj == Py_None)
+		return &drgn_not_found;
+	return py_type_find_fn_common(type_obj, arg, ret);
+}
+
+// Old version for add_type_finder().
+static struct drgn_error *py_type_find_fn_old(uint64_t kinds, const char *name,
+					      size_t name_len,
+					      const char *filename, void *arg,
+					      struct drgn_qualified_type *ret)
 {
 	PyGILState_guard();
 
@@ -395,54 +590,9 @@ static struct drgn_error *py_type_find_fn(uint64_t kinds, const char *name,
 			return drgn_error_from_python();
 		if (type_obj == Py_None)
 			continue;
-		if (!PyObject_TypeCheck(type_obj, &DrgnType_type)) {
-			PyErr_SetString(PyExc_TypeError,
-					"type find callback must return Type or None");
-			return drgn_error_from_python();
-		}
-		// This check is also done in libdrgn, but we need it here
-		// because if the type isn't from this program, then there's no
-		// guarantee that it will remain valid after we decrement its
-		// reference count.
-		if (DrgnType_prog((DrgnType *)type_obj)
-		    != (Program *)PyTuple_GET_ITEM(arg, 0)) {
-			PyErr_SetString(PyExc_ValueError,
-					"type find callback returned type from wrong program");
-			return drgn_error_from_python();
-		}
-		ret->type = ((DrgnType *)type_obj)->type;
-		ret->qualifiers = ((DrgnType *)type_obj)->qualifiers;
-		return NULL;
+		return py_type_find_fn_common(type_obj, arg, ret);
 	}
 	return &drgn_not_found;
-}
-
-static PyObject *Program_add_type_finder(Program *self, PyObject *args,
-					 PyObject *kwds)
-{
-	struct drgn_error *err;
-
-	static char *keywords[] = {"fn", NULL};
-	PyObject *fn;
-	if (!PyArg_ParseTupleAndKeywords(args, kwds, "O:add_type_finder",
-					 keywords, &fn))
-	    return NULL;
-
-	if (!PyCallable_Check(fn)) {
-		PyErr_SetString(PyExc_TypeError, "fn must be callable");
-		return NULL;
-	}
-
-	_cleanup_pydecref_ PyObject *arg = Py_BuildValue("OO", self, fn);
-	if (!arg)
-		return NULL;
-	if (Program_hold_object(self, arg))
-		return NULL;
-
-	err = drgn_program_add_type_finder(&self->prog, py_type_find_fn, arg);
-	if (err)
-		return set_drgn_error(err);
-	Py_RETURN_NONE;
 }
 
 static struct drgn_error *py_object_find_fn(const char *name, size_t name_len,
@@ -461,9 +611,9 @@ static struct drgn_error *py_object_find_fn(const char *name, size_t name_len,
 	if (!flags_obj)
 		return drgn_error_from_python();
 	_cleanup_pydecref_ PyObject *obj =
-		PyObject_CallFunction(PyTuple_GET_ITEM(arg, 1), "OOOs",
-				      PyTuple_GET_ITEM(arg, 0), name_obj,
-				      flags_obj, filename);
+		PyObject_CallFunction(arg, "OOOs",
+				      container_of(drgn_object_program(ret), Program, prog),
+				      name_obj, flags_obj, filename);
 	if (!obj)
 		return drgn_error_from_python();
 	if (obj == Py_None)
@@ -475,6 +625,289 @@ static struct drgn_error *py_object_find_fn(const char *name, size_t name_len,
 	}
 
 	return drgn_object_copy(ret, &((DrgnObject *)obj)->obj);
+}
+
+static struct drgn_error *
+py_symbol_find_fn(const char *name, uint64_t addr,
+		  enum drgn_find_symbol_flags flags, void *arg,
+		  struct drgn_symbol_result_builder *builder)
+{
+	// Fast path for SymbolIndex: don't bother converting to and from Python
+	// types, as this is a C finder. Use Py_TYPE and pointer comparison
+	// directly here to avoid needing to take the GIL for
+	// PyObject_TypeCheck(). SymbolIndex cannot be subclassed, so the logic
+	// for subclass checking is unnecessary anyway.
+	if (Py_TYPE(PyTuple_GET_ITEM(arg, 1)) == &SymbolIndex_type) {
+		SymbolIndex *ix = (SymbolIndex *)PyTuple_GET_ITEM(arg, 1);
+		return drgn_symbol_index_find(name, addr, flags, &ix->index, builder);
+	}
+
+	PyGILState_guard();
+
+	_cleanup_pydecref_ PyObject *name_obj = NULL;
+	if (flags & DRGN_FIND_SYMBOL_NAME) {
+		name_obj = PyUnicode_FromString(name);
+		if (!name_obj)
+			return drgn_error_from_python();
+	} else {
+		name_obj = Py_None;
+		Py_INCREF(name_obj);
+	}
+
+	_cleanup_pydecref_ PyObject *address_obj = NULL;
+	if (flags & DRGN_FIND_SYMBOL_ADDR) {
+		address_obj = PyLong_FromUnsignedLong(addr);
+		if (!address_obj)
+			return drgn_error_from_python();
+	} else {
+		address_obj = Py_None;
+		Py_INCREF(address_obj);
+	}
+
+	_cleanup_pydecref_ PyObject *one_obj = PyBool_FromLong(flags & DRGN_FIND_SYMBOL_ONE);
+
+	_cleanup_pydecref_ PyObject *tmp =
+		PyObject_CallFunction(PyTuple_GET_ITEM(arg, 1), "OOOO",
+				      PyTuple_GET_ITEM(arg, 0), name_obj,
+				      address_obj, one_obj);
+	if (!tmp)
+		return drgn_error_from_python();
+
+	_cleanup_pydecref_ PyObject *obj =
+		PySequence_Fast(tmp, "symbol finder must return a sequence");
+	if (!obj)
+		return drgn_error_from_python();
+
+	size_t len = PySequence_Fast_GET_SIZE(obj);
+	if (len > 1 && (flags & DRGN_FIND_SYMBOL_ONE))  {
+		return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
+					 "symbol finder returned multiple elements, but one was requested");
+	}
+
+	for (size_t i = 0; i < len; i++) {
+		PyObject *item = PySequence_Fast_GET_ITEM(obj, i);
+		if (!PyObject_TypeCheck(item, &Symbol_type))
+			return drgn_error_create(DRGN_ERROR_TYPE,
+						 "symbol finder results must be of type Symbol");
+		_cleanup_free_ struct drgn_symbol *sym = malloc(sizeof(*sym));
+		if (!sym)
+			return &drgn_enomem;
+		struct drgn_error *err = drgn_symbol_copy(sym, ((Symbol *)item)->sym);
+		if (err)
+			return err;
+
+		if (!drgn_symbol_result_builder_add(builder, sym))
+			return &drgn_enomem;
+		sym = NULL; // owned by the builder now
+	}
+
+	return NULL;
+}
+
+#define debug_info_finder_arg(self, fn) PyObject *arg = fn;
+#define type_finder_arg(self, fn)						\
+	_cleanup_pydecref_ PyObject *arg = Py_BuildValue("OO", self, fn);	\
+	if (!arg)								\
+		return NULL;
+#define object_finder_arg(self, fn) PyObject *arg = fn;
+#define symbol_finder_arg type_finder_arg
+
+#define DEFINE_PROGRAM_FINDER_METHODS(which)					\
+static PyObject *Program_register_##which##_finder(Program *self,		\
+						   PyObject *args,		\
+						   PyObject *kwds)		\
+{										\
+	struct drgn_error *err;							\
+	static char *keywords[] = {"name", "fn", "enable_index", NULL};		\
+	const char *name;							\
+	PyObject *fn;								\
+	PyObject *enable_index_obj = Py_None;					\
+	if (!PyArg_ParseTupleAndKeywords(args, kwds,				\
+					 "sO|$O:register_" #which "_finder",	\
+					 keywords, &name, &fn,			\
+					 &enable_index_obj))			\
+		return NULL;							\
+										\
+	if (!PyCallable_Check(fn)) {						\
+		PyErr_SetString(PyExc_TypeError, "fn must be callable");	\
+		return NULL;							\
+	}									\
+										\
+	size_t enable_index;							\
+	if (enable_index_obj == Py_None) {					\
+		enable_index = DRGN_HANDLER_REGISTER_DONT_ENABLE;		\
+	} else {								\
+		_cleanup_pydecref_ PyObject *negative_one = PyLong_FromLong(-1);\
+		if (!negative_one)						\
+			return NULL;						\
+		int eq = PyObject_RichCompareBool(enable_index_obj,		\
+						  negative_one, Py_EQ);		\
+		if (eq < 0)							\
+			return NULL;						\
+		if (eq) {							\
+			enable_index = DRGN_HANDLER_REGISTER_ENABLE_LAST;	\
+		} else {							\
+			enable_index = PyLong_AsSize_t(enable_index_obj);	\
+			if (enable_index == (size_t)-1 && PyErr_Occurred())	\
+				return NULL;					\
+			/*							\
+			 * If the index happens to be the			\
+			 * DRGN_HANDLER_REGISTER_DONT_ENABLE sentinel		\
+			 * (SIZE_MAX - 1), set it to something else; it's	\
+			 * impossible to have this many finders anyways.	\
+			 */							\
+			if (enable_index == DRGN_HANDLER_REGISTER_DONT_ENABLE)	\
+				enable_index--;					\
+		}								\
+	}									\
+										\
+	which##_finder_arg(self, fn)						\
+	if (!Program_hold_reserve(self, 1))					\
+		return NULL;							\
+	const struct drgn_##which##_finder_ops ops = {				\
+		.find = py_##which##_find_fn,					\
+	};									\
+	err = drgn_program_register_##which##_finder(&self->prog, name, &ops,	\
+						     arg, enable_index);	\
+	if (err)								\
+		return set_drgn_error(err);					\
+	Program_hold_object(self, arg);						\
+	Py_RETURN_NONE;								\
+										\
+}										\
+										\
+static PyObject *Program_registered_##which##_finders(Program *self)		\
+{										\
+	struct drgn_error *err;							\
+	_cleanup_free_ const char **names = NULL;				\
+	size_t count;								\
+	err = drgn_program_registered_##which##_finders(&self->prog, &names,	\
+							&count);		\
+	if (err)								\
+		return set_drgn_error(err);					\
+	_cleanup_pydecref_ PyObject *res = PySet_New(NULL);			\
+	if (!res)								\
+		return NULL;							\
+	for (size_t i = 0; i < count; i++) {					\
+		_cleanup_pydecref_ PyObject *name =				\
+			PyUnicode_FromString(names[i]);				\
+		if (!name)							\
+			return NULL;						\
+		if (PySet_Add(res, name))					\
+			return NULL;						\
+	}									\
+	return_ptr(res);							\
+}										\
+										\
+static PyObject *Program_set_enabled_##which##_finders(Program *self,		\
+						       PyObject *args,		\
+						       PyObject *kwds)		\
+{										\
+	struct drgn_error *err;							\
+	static char *keywords[] = {"names", NULL};				\
+	PyObject *names_obj;							\
+	if (!PyArg_ParseTupleAndKeywords(args, kwds,				\
+					 "O:set_enabled_" #which "_finders",	\
+					 keywords, &names_obj))			\
+		return NULL;							\
+	_cleanup_pydecref_ PyObject *names_seq =				\
+		PySequence_Fast(names_obj, "names must be sequence");		\
+	if (!names_seq)								\
+		return NULL;							\
+	size_t count = PySequence_Fast_GET_SIZE(names_seq);			\
+	_cleanup_free_ const char **names =					\
+		malloc_array(count, sizeof(names[0]));				\
+	if (!names)								\
+		return NULL;							\
+	for (size_t i = 0; i < count; i++) {					\
+		names[i] = PyUnicode_AsUTF8(PySequence_Fast_GET_ITEM(names_seq, i));\
+		if (!names[i])							\
+			return NULL;						\
+	}									\
+	err = drgn_program_set_enabled_##which##_finders(&self->prog, names,	\
+							 count);		\
+	if (err)								\
+		return set_drgn_error(err);					\
+	Py_RETURN_NONE;								\
+}										\
+										\
+static PyObject *Program_enabled_##which##_finders(Program *self)		\
+{										\
+	struct drgn_error *err;							\
+	_cleanup_free_ const char **names = NULL;				\
+	size_t count;								\
+	err = drgn_program_enabled_##which##_finders(&self->prog, &names,	\
+						     &count);			\
+	if (err)								\
+		return set_drgn_error(err);					\
+	_cleanup_pydecref_ PyObject *res = PyList_New(count);			\
+	if (!res)								\
+		return NULL;							\
+	for (size_t i = 0; i < count; i++) {					\
+		PyObject *name = PyUnicode_FromString(names[i]);		\
+		if (!name)							\
+			return NULL;						\
+		PyList_SET_ITEM(res, i, name);					\
+	}									\
+	return_ptr(res);							\
+}
+
+DEFINE_PROGRAM_FINDER_METHODS(debug_info)
+DEFINE_PROGRAM_FINDER_METHODS(type)
+DEFINE_PROGRAM_FINDER_METHODS(object)
+DEFINE_PROGRAM_FINDER_METHODS(symbol)
+
+static PyObject *deprecated_finder_name_obj(PyObject *fn)
+{
+	_cleanup_pydecref_ PyObject *name_attr_obj =
+		PyObject_GetAttrString(fn, "__name__");
+	if (name_attr_obj) {
+		return PyUnicode_FromFormat("%S_%lu", name_attr_obj, random());
+	} else if (PyErr_ExceptionMatches(PyExc_AttributeError)) {
+		PyErr_Clear();
+		return PyUnicode_FromFormat("%lu", random());
+	} else {
+		return NULL;
+	}
+}
+
+static PyObject *Program_add_type_finder(Program *self, PyObject *args,
+					 PyObject *kwds)
+{
+	struct drgn_error *err;
+	static char *keywords[] = {"fn", NULL};
+	PyObject *fn;
+	if (!PyArg_ParseTupleAndKeywords(args, kwds, "O:add_type_finder",
+					 keywords, &fn))
+	    return NULL;
+
+	if (!PyCallable_Check(fn)) {
+		PyErr_SetString(PyExc_TypeError, "fn must be callable");
+		return NULL;
+	}
+
+	_cleanup_pydecref_ PyObject *arg = Py_BuildValue("OO", self, fn);
+	if (!arg)
+		return NULL;
+
+	_cleanup_pydecref_ PyObject *name_obj = deprecated_finder_name_obj(fn);
+	if (!name_obj)
+		return NULL;
+	const char *name = PyUnicode_AsUTF8(name_obj);
+	if (!name)
+		return NULL;
+
+	if (!Program_hold_reserve(self, 1))
+		return NULL;
+	const struct drgn_type_finder_ops ops = {
+		.find = py_type_find_fn_old,
+	};
+	err = drgn_program_register_type_finder(&self->prog, name, &ops, arg,
+						0);
+	if (err)
+		return set_drgn_error(err);
+	Program_hold_object(self, arg);
+	Py_RETURN_NONE;
 }
 
 static PyObject *Program_add_object_finder(Program *self, PyObject *args,
@@ -493,16 +926,23 @@ static PyObject *Program_add_object_finder(Program *self, PyObject *args,
 		return NULL;
 	}
 
-	_cleanup_pydecref_ PyObject *arg = Py_BuildValue("OO", self, fn);
-	if (!arg)
+	_cleanup_pydecref_ PyObject *name_obj = deprecated_finder_name_obj(fn);
+	if (!name_obj)
 		return NULL;
-	if (Program_hold_object(self, arg))
+	const char *name = PyUnicode_AsUTF8(name_obj);
+	if (!name)
 		return NULL;
 
-	err = drgn_program_add_object_finder(&self->prog, py_object_find_fn,
-					     arg);
+	if (!Program_hold_reserve(self, 1))
+		return NULL;
+	const struct drgn_object_finder_ops ops = {
+		.find = py_object_find_fn,
+	};
+	err = drgn_program_register_object_finder(&self->prog, name, &ops, fn,
+						  0);
 	if (err)
 		return set_drgn_error(err);
+	Program_hold_object(self, fn);
 	Py_RETURN_NONE;
 }
 
@@ -511,7 +951,7 @@ static PyObject *Program_set_core_dump(Program *self, PyObject *args,
 {
 	static char *keywords[] = {"path", NULL};
 	struct drgn_error *err;
-	struct path_arg path = { .allow_fd = true };
+	PATH_ARG(path, .allow_fd = true);
 
 	if (!PyArg_ParseTupleAndKeywords(args, kwds, "O&:set_core_dump",
 					 keywords, path_converter, &path))
@@ -521,7 +961,6 @@ static PyObject *Program_set_core_dump(Program *self, PyObject *args,
 		err = drgn_program_set_core_dump_fd(&self->prog, path.fd);
 	else
 		err = drgn_program_set_core_dump(&self->prog, path.path);
-	path_cleanup(&path);
 	if (err)
 		return set_drgn_error(err);
 	Py_RETURN_NONE;
@@ -553,7 +992,331 @@ static PyObject *Program_set_pid(Program *self, PyObject *args, PyObject *kwds)
 	Py_RETURN_NONE;
 }
 
+static ModuleIterator *Program_modules(Program *self)
+{
+	struct drgn_error *err;
+	ModuleIterator *it = call_tp_alloc(ModuleIterator);
+	if (!it)
+		return NULL;
+	err = drgn_created_module_iterator_create(&self->prog, &it->it);
+	if (err) {
+		it->it = NULL;
+		Py_DECREF(it);
+		return set_drgn_error(err);
+	}
+	Py_INCREF(self);
+	return it;
+}
+
+static ModuleIterator *Program_loaded_modules(Program *self)
+{
+	struct drgn_error *err;
+	ModuleIterator *it =
+		(ModuleIterator *)ModuleIteratorWithNew_type.tp_alloc(
+					&ModuleIteratorWithNew_type, 0);
+	if (!it)
+		return NULL;
+	err = drgn_loaded_module_iterator_create(&self->prog, &it->it);
+	if (err) {
+		it->it = NULL;
+		Py_DECREF(it);
+		return set_drgn_error(err);
+	}
+	Py_INCREF(self);
+	return it;
+}
+
+static PyObject *Program_main_module(Program *self, PyObject *args,
+				     PyObject *kwds)
+{
+	struct drgn_error *err;
+	static char *keywords[] = {"name", "create", NULL};
+	PATH_ARG(name);
+	int create = 0;
+	if (!PyArg_ParseTupleAndKeywords(args, kwds, "|O&$p:main_module",
+					 keywords, path_converter, &name,
+					 &create))
+		return NULL;
+
+	if (create) {
+		if (!name.path) {
+			PyErr_SetString(PyExc_TypeError,
+					"name must be given if create=True");
+			return NULL;
+		}
+		struct drgn_module *module;
+		bool new;
+		err = drgn_module_find_or_create_main(&self->prog, name.path,
+						      &module, &new);
+		if (err) {
+			set_drgn_error(err);
+			return NULL;
+		}
+		return Module_and_bool_wrap(module, new);
+	} else {
+		struct drgn_module_key key = { .kind = DRGN_MODULE_MAIN };
+		struct drgn_module *module = drgn_module_find(&self->prog, &key);
+		if (!module
+		    || (name.path
+			&& strcmp(drgn_module_name(module), name.path) != 0)) {
+			PyErr_SetString(PyExc_LookupError, "module not found");
+			return NULL;
+		}
+		return Module_wrap(module);
+	}
+}
+
+static PyObject *Program_find_module(Program *self, const struct drgn_module_key *key)
+{
+	struct drgn_module *module = drgn_module_find(&self->prog, key);
+	if (!module) {
+		PyErr_SetString(PyExc_LookupError, "module not found");
+		return NULL;
+	}
+	return Module_wrap(module);
+}
+
+static PyObject *Program_shared_library_module(Program *self, PyObject *args,
+					       PyObject *kwds)
+{
+	struct drgn_error *err;
+	static char *keywords[] = {"name", "dynamic_address", "create", NULL};
+	PATH_ARG(name);
+	struct index_arg dynamic_address = {};
+	int create = 0;
+	if (!PyArg_ParseTupleAndKeywords(args, kwds,
+					 "O&O&|$p:shared_library_module",
+					 keywords, path_converter, &name,
+					 index_converter, &dynamic_address,
+					 &create))
+		return NULL;
+
+	if (create) {
+		struct drgn_module *module;
+		bool new;
+		err = drgn_module_find_or_create_shared_library(&self->prog,
+								name.path,
+								dynamic_address.uvalue,
+								&module, &new);
+		if (err) {
+			set_drgn_error(err);
+			return NULL;
+		}
+		return Module_and_bool_wrap(module, new);
+	} else {
+		struct drgn_module_key key = {
+			.kind = DRGN_MODULE_SHARED_LIBRARY,
+			.shared_library.name = name.path,
+			.shared_library.dynamic_address =
+				dynamic_address.uvalue,
+		};
+		return Program_find_module(self, &key);
+	}
+}
+
+static PyObject *Program_vdso_module(Program *self, PyObject *args,
+				     PyObject *kwds)
+{
+	struct drgn_error *err;
+	static char *keywords[] = {"name", "dynamic_address", "create", NULL};
+	PATH_ARG(name);
+	struct index_arg dynamic_address = {};
+	int create = 0;
+	if (!PyArg_ParseTupleAndKeywords(args, kwds, "O&O&|$p:vdso_module",
+					 keywords, path_converter, &name,
+					 index_converter, &dynamic_address,
+					 &create))
+		return NULL;
+
+	if (create) {
+		struct drgn_module *module;
+		bool new;
+		err = drgn_module_find_or_create_vdso(&self->prog, name.path,
+						      dynamic_address.uvalue,
+						      &module, &new);
+		if (err) {
+			set_drgn_error(err);
+			return NULL;
+		}
+		return Module_and_bool_wrap(module, new);
+	} else {
+		struct drgn_module_key key = {
+			.kind = DRGN_MODULE_VDSO,
+			.vdso.name = name.path,
+			.vdso.dynamic_address = dynamic_address.uvalue,
+		};
+		return Program_find_module(self, &key);
+	}
+}
+
+static PyObject *Program_relocatable_module(Program *self, PyObject *args,
+					    PyObject *kwds)
+{
+	struct drgn_error *err;
+	static char *keywords[] = {"name", "address", "create", NULL};
+	PATH_ARG(name);
+	struct index_arg address = {};
+	int create = 0;
+	if (!PyArg_ParseTupleAndKeywords(args, kwds,
+					 "O&O&|$p:relocatable_module", keywords,
+					 path_converter, &name, index_converter,
+					 &address, &create))
+		return NULL;
+
+	if (create) {
+		struct drgn_module *module;
+		bool new;
+		err = drgn_module_find_or_create_relocatable(&self->prog,
+							     name.path,
+							     address.uvalue,
+							     &module, &new);
+		if (err) {
+			set_drgn_error(err);
+			return NULL;
+		}
+		return Module_and_bool_wrap(module, new);
+	} else {
+		struct drgn_module_key key = {
+			.kind = DRGN_MODULE_RELOCATABLE,
+			.relocatable.name = name.path,
+			.relocatable.address = address.uvalue,
+		};
+		return Program_find_module(self, &key);
+	}
+}
+
+static PyObject *Program_linux_kernel_loadable_module(Program *self,
+						      PyObject *args,
+						      PyObject *kwds)
+{
+	struct drgn_error *err;
+	static char *keywords[] = {"module_obj", "create", NULL};
+	DrgnObject *module_obj;
+	int create = 0;
+	if (!PyArg_ParseTupleAndKeywords(args, kwds,
+					 "O!|$p:linux_kernel_loadable_module",
+					 keywords, &DrgnObject_type,
+					 &module_obj, &create))
+		return NULL;
+
+	if (DrgnObject_prog(module_obj) != self) {
+		PyErr_SetString(PyExc_ValueError,
+				"object is from different program");
+		return NULL;
+	}
+
+	struct drgn_module *module;
+	if (create) {
+		bool new;
+		err = drgn_module_find_or_create_linux_kernel_loadable(&module_obj->obj,
+								       &module,
+								       &new);
+		if (err) {
+			set_drgn_error(err);
+			return NULL;
+		}
+		return Module_and_bool_wrap(module, new);
+	} else {
+		err = drgn_module_find_linux_kernel_loadable(&module_obj->obj,
+							     &module);
+		if (err) {
+			set_drgn_error(err);
+			return NULL;
+		}
+		if (!module) {
+			PyErr_SetString(PyExc_LookupError, "module not found");
+			return NULL;
+		}
+		return Module_wrap(module);
+	}
+}
+
+static PyObject *Program_extra_module(Program *self, PyObject *args,
+				      PyObject *kwds)
+{
+	struct drgn_error *err;
+	static char *keywords[] = {"name", "id", "create", NULL};
+	PATH_ARG(name);
+	struct index_arg id = {};
+	int create = 0;
+	if (!PyArg_ParseTupleAndKeywords(args, kwds, "O&|O&$p:extra_module",
+					 keywords, path_converter, &name,
+					 index_converter, &id, &create))
+		return NULL;
+
+	if (create) {
+		struct drgn_module *module;
+		bool new;
+		err = drgn_module_find_or_create_extra(&self->prog, name.path,
+						       id.uvalue, &module,
+						       &new);
+		if (err) {
+			set_drgn_error(err);
+			return NULL;
+		}
+		return Module_and_bool_wrap(module, new);
+	} else {
+		struct drgn_module_key key = {
+			.kind = DRGN_MODULE_EXTRA,
+			.extra.name = name.path,
+			.extra.id = id.uvalue,
+		};
+		return Program_find_module(self, &key);
+	}
+}
+
+static PyObject *Program_module(Program *self, PyObject *arg)
+{
+	struct index_arg address = {};
+	if (!index_converter(arg, &address))
+		return NULL;
+	struct drgn_module *module =
+		drgn_module_find_by_address(&self->prog, address.uvalue);
+	if (!module) {
+		PyErr_SetString(PyExc_LookupError, "module not found");
+		return NULL;
+	}
+	return Module_wrap(module);
+}
+
+static PyObject *Program_get_debug_info_path(Program *self, void *arg)
+{
+	return PyUnicode_FromString(drgn_program_debug_info_path(&self->prog));
+}
+
+static int Program_set_debug_info_path(Program *self, PyObject *value, void *arg)
+{
+	SETTER_NO_DELETE("debug_info_path", value);
+	const char *path;
+	if (value == Py_None) {
+		path = NULL;
+	} else {
+		if (!PyUnicode_Check(value)) {
+			PyErr_SetString(PyExc_TypeError,
+					"debug_info_path must be str or None");
+			return -1;
+		}
+		path = PyUnicode_AsUTF8(value);
+		if (!path)
+			return -1;
+	}
+	struct drgn_error *err =
+		drgn_program_set_debug_info_path(&self->prog, path);
+	if (err) {
+		set_drgn_error(err);
+		return -1;
+	}
+	return 0;
+}
+
 DEFINE_VECTOR(path_arg_vector, struct path_arg);
+
+static void path_arg_vector_cleanup(struct path_arg_vector *path_args)
+{
+	vector_for_each(path_arg_vector, path_arg, path_args)
+		path_cleanup(path_arg);
+	path_arg_vector_deinit(path_args);
+}
 
 static PyObject *Program_load_debug_info(Program *self, PyObject *args,
 					 PyObject *kwds)
@@ -568,19 +1331,20 @@ static PyObject *Program_load_debug_info(Program *self, PyObject *args,
 					 &load_main))
 		return NULL;
 
-	struct path_arg_vector path_args = VECTOR_INIT;
-	const char **paths = NULL;
+	_cleanup_(path_arg_vector_cleanup)
+		struct path_arg_vector path_args = VECTOR_INIT;
+	_cleanup_free_ const char **paths = NULL;
 	if (paths_obj != Py_None) {
 		_cleanup_pydecref_ PyObject *it = PyObject_GetIter(paths_obj);
 		if (!it)
-			goto out;
+			return NULL;
 
 		Py_ssize_t length_hint = PyObject_LengthHint(paths_obj, 1);
 		if (length_hint == -1)
-			goto out;
+			return NULL;
 		if (!path_arg_vector_reserve(&path_args, length_hint)) {
 			PyErr_NoMemory();
-			goto out;
+			return NULL;
 		}
 
 		for (;;) {
@@ -592,22 +1356,22 @@ static PyObject *Program_load_debug_info(Program *self, PyObject *args,
 				path_arg_vector_append_entry(&path_args);
 			if (!path_arg) {
 				PyErr_NoMemory();
-				break;
+				return NULL;
 			}
 			memset(path_arg, 0, sizeof(*path_arg));
 			if (!path_converter(item, path_arg)) {
 				path_arg_vector_pop(&path_args);
-				break;
+				return NULL;
 			}
 		}
 		if (PyErr_Occurred())
-			goto out;
+			return NULL;
 
 		paths = malloc_array(path_arg_vector_size(&path_args),
 				     sizeof(*paths));
 		if (!paths) {
 			PyErr_NoMemory();
-			goto out;
+			return NULL;
 		}
 		for (size_t i = 0; i < path_arg_vector_size(&path_args); i++)
 			paths[i] = path_arg_vector_at(&path_args, i)->path;
@@ -615,16 +1379,10 @@ static PyObject *Program_load_debug_info(Program *self, PyObject *args,
 	err = drgn_program_load_debug_info(&self->prog, paths,
 					   path_arg_vector_size(&path_args),
 					   load_default, load_main);
-	free(paths);
-	if (err)
+	if (err) {
 		set_drgn_error(err);
-
-out:
-	vector_for_each(path_arg_vector, path_arg, &path_args)
-		path_cleanup(path_arg);
-	path_arg_vector_deinit(&path_args);
-	if (PyErr_Occurred())
 		return NULL;
+	}
 	Py_RETURN_NONE;
 }
 
@@ -633,6 +1391,40 @@ static PyObject *Program_load_default_debug_info(Program *self)
 	struct drgn_error *err;
 
 	err = drgn_program_load_debug_info(&self->prog, NULL, 0, true, true);
+	if (err)
+		return set_drgn_error(err);
+	Py_RETURN_NONE;
+}
+
+DEFINE_VECTOR(drgn_module_vector, struct drgn_module *);
+
+static PyObject *Program_load_module_debug_info(Program *self, PyObject *args)
+{
+	size_t num_modules = PyTuple_GET_SIZE(args);
+	_cleanup_free_ struct drgn_module **modules =
+		malloc_array(num_modules, sizeof(*modules));
+	if (!modules) {
+		PyErr_NoMemory();
+		return NULL;
+	}
+
+	for (size_t i = 0; i < num_modules; i++) {
+		PyObject *item = PyTuple_GET_ITEM(args, i);
+		if (!PyObject_TypeCheck(item, &Module_type)) {
+			return PyErr_Format(PyExc_TypeError,
+					    "expected Module, not %s",
+					    Py_TYPE(item)->tp_name);
+		}
+		modules[i] = ((Module *)item)->module;
+		if (modules[i]->prog != &self->prog) {
+			PyErr_SetString(PyExc_ValueError,
+					"module from wrong program");
+			return NULL;
+		}
+	}
+
+	struct drgn_error *err =
+		drgn_load_module_debug_info(modules, &num_modules);
 	if (err)
 		return set_drgn_error(err);
 	Py_RETURN_NONE;
@@ -704,31 +1496,29 @@ static PyObject *Program_find_type(Program *self, PyObject *args, PyObject *kwds
 	static char *keywords[] = {"name", "filename", NULL};
 	struct drgn_error *err;
 	PyObject *name_or_type;
-	struct path_arg filename = {.allow_none = true};
+	PATH_ARG(filename, .allow_none = true);
 	if (!PyArg_ParseTupleAndKeywords(args, kwds, "O|O&:type", keywords,
 					 &name_or_type, path_converter,
 					 &filename))
 		return NULL;
 
-	PyObject *ret = NULL;
 	if (PyObject_TypeCheck(name_or_type, &DrgnType_type)) {
 		if (DrgnType_prog((DrgnType *)name_or_type) != self) {
 			PyErr_SetString(PyExc_ValueError,
 					"type is from different program");
-			goto out;
+			return NULL;
 		}
 		Py_INCREF(name_or_type);
-		ret = name_or_type;
-		goto out;
+		return name_or_type;
 	} else if (!PyUnicode_Check(name_or_type)) {
 		PyErr_SetString(PyExc_TypeError,
 				"type() argument 1 must be str or Type");
-		goto out;
+		return NULL;
 	}
 
 	const char *name = PyUnicode_AsUTF8(name_or_type);
 	if (!name)
-		goto out;
+		return NULL;
 	bool clear = set_drgn_in_python();
 	struct drgn_qualified_type qualified_type;
 	err = drgn_program_find_type(&self->prog, name, filename.path,
@@ -737,12 +1527,9 @@ static PyObject *Program_find_type(Program *self, PyObject *args, PyObject *kwds
 		clear_drgn_in_python();
 	if (err) {
 		set_drgn_error(err);
-		goto out;
+		return NULL;
 	}
-	ret = DrgnType_wrap(qualified_type);
-out:
-	path_cleanup(&filename);
-	return ret;
+	return DrgnType_wrap(qualified_type);
 }
 
 static DrgnObject *Program_find_object(Program *self, const char *name,
@@ -751,9 +1538,9 @@ static DrgnObject *Program_find_object(Program *self, const char *name,
 {
 	struct drgn_error *err;
 
-	DrgnObject *ret = DrgnObject_alloc(self);
+	_cleanup_pydecref_ DrgnObject *ret = DrgnObject_alloc(self);
 	if (!ret)
-		goto out;
+		return NULL;
 	bool clear = set_drgn_in_python();
 	err = drgn_program_find_object(&self->prog, name, filename->path, flags,
 				       &ret->obj);
@@ -761,12 +1548,9 @@ static DrgnObject *Program_find_object(Program *self, const char *name,
 		clear_drgn_in_python();
 	if (err) {
 		set_drgn_error(err);
-		Py_DECREF(ret);
-		ret = NULL;
+		return NULL;
 	}
-out:
-	path_cleanup(filename);
-	return ret;
+	return_ptr(ret);
 }
 
 static DrgnObject *Program_object(Program *self, PyObject *args,
@@ -778,7 +1562,7 @@ static DrgnObject *Program_object(Program *self, PyObject *args,
 		.type = FindObjectFlags_class,
 		.value = DRGN_FIND_OBJECT_ANY,
 	};
-	struct path_arg filename = {.allow_none = true};
+	PATH_ARG(filename, .allow_none = true);
 
 	if (!PyArg_ParseTupleAndKeywords(args, kwds, "s|O&O&:object", keywords,
 					 &name, enum_converter, &flags,
@@ -793,7 +1577,7 @@ static DrgnObject *Program_constant(Program *self, PyObject *args,
 {
 	static char *keywords[] = {"name", "filename", NULL};
 	const char *name;
-	struct path_arg filename = {.allow_none = true};
+	PATH_ARG(filename, .allow_none = true);
 
 	if (!PyArg_ParseTupleAndKeywords(args, kwds, "s|O&:constant", keywords,
 					 &name, path_converter, &filename))
@@ -808,7 +1592,7 @@ static DrgnObject *Program_function(Program *self, PyObject *args,
 {
 	static char *keywords[] = {"name", "filename", NULL};
 	const char *name;
-	struct path_arg filename = {.allow_none = true};
+	PATH_ARG(filename, .allow_none = true);
 
 	if (!PyArg_ParseTupleAndKeywords(args, kwds, "s|O&:function", keywords,
 					 &name, path_converter, &filename))
@@ -823,7 +1607,7 @@ static DrgnObject *Program_variable(Program *self, PyObject *args,
 {
 	static char *keywords[] = {"name", "filename", NULL};
 	const char *name;
-	struct path_arg filename = {.allow_none = true};
+	PATH_ARG(filename, .allow_none = true);
 
 	if (!PyArg_ParseTupleAndKeywords(args, kwds, "s|O&:variable", keywords,
 					 &name, path_converter, &filename))
@@ -931,23 +1715,7 @@ static PyObject *Program_symbols(Program *self, PyObject *args)
 	if (err)
 		return set_drgn_error(err);
 
-	_cleanup_pydecref_ PyObject *list = PyList_New(count);
-	if (!list) {
-		drgn_symbols_destroy(symbols, count);
-		return NULL;
-	}
-	for (size_t i = 0; i < count; i++) {
-		PyObject *pysym = Symbol_wrap(symbols[i], self);
-		if (!pysym) {
-			/* Free symbols which aren't yet added to list. */
-			drgn_symbols_destroy(symbols, count);
-			return NULL;
-		}
-		symbols[i] = NULL;
-		PyList_SET_ITEM(list, i, pysym);
-	}
-	free(symbols);
-	return_ptr(list);
+	return Symbol_list_wrap(symbols, count, (PyObject *)self);
 }
 
 static PyObject *Program_symbol(Program *self, PyObject *arg)
@@ -973,7 +1741,7 @@ static PyObject *Program_symbol(Program *self, PyObject *arg)
 	}
 	if (err)
 		return set_drgn_error(err);
-	ret = Symbol_wrap(sym, self);
+	ret = Symbol_wrap(sym, (PyObject *)self);
 	if (!ret) {
 		drgn_symbol_destroy(sym);
 		return NULL;
@@ -1142,6 +1910,7 @@ static PyObject *Program_get_language(Program *self, void *arg)
 
 static int Program_set_language(Program *self, PyObject *value, void *arg)
 {
+	SETTER_NO_DELETE("language", value);
 	if (!PyObject_TypeCheck(value, &Language_type)) {
 		PyErr_SetString(PyExc_TypeError, "language must be Language");
 		return -1;
@@ -1150,9 +1919,29 @@ static int Program_set_language(Program *self, PyObject *value, void *arg)
 	return 0;
 }
 
+#define PROGRAM_FINDER_METHOD_DEFS(which)					\
+	{"register_" #which "_finder",						\
+	 (PyCFunction)Program_register_##which##_finder,			\
+	 METH_VARARGS | METH_KEYWORDS,						\
+	 drgn_Program_register_##which##_finder_DOC},				\
+	{"registered_" #which "_finders",					\
+	 (PyCFunction)Program_registered_##which##_finders, METH_NOARGS,	\
+	 drgn_Program_registered_##which##_finders_DOC},			\
+	{"set_enabled_" #which "_finders",					\
+	 (PyCFunction)Program_set_enabled_##which##_finders,			\
+	 METH_VARARGS | METH_KEYWORDS,						\
+	 drgn_Program_set_enabled_##which##_finders_DOC},			\
+	{"enabled_" #which "_finders",						\
+	 (PyCFunction)Program_enabled_##which##_finders, METH_NOARGS,		\
+	 drgn_Program_enabled_##which##_finders_DOC}
+
 static PyMethodDef Program_methods[] = {
 	{"add_memory_segment", (PyCFunction)Program_add_memory_segment,
 	 METH_VARARGS | METH_KEYWORDS, drgn_Program_add_memory_segment_DOC},
+	PROGRAM_FINDER_METHOD_DEFS(debug_info),
+	PROGRAM_FINDER_METHOD_DEFS(type),
+	PROGRAM_FINDER_METHOD_DEFS(object),
+	PROGRAM_FINDER_METHOD_DEFS(symbol),
 	{"add_type_finder", (PyCFunction)Program_add_type_finder,
 	 METH_VARARGS | METH_KEYWORDS, drgn_Program_add_type_finder_DOC},
 	{"add_object_finder", (PyCFunction)Program_add_object_finder,
@@ -1163,11 +1952,33 @@ static PyMethodDef Program_methods[] = {
 	 drgn_Program_set_kernel_DOC},
 	{"set_pid", (PyCFunction)Program_set_pid, METH_VARARGS | METH_KEYWORDS,
 	 drgn_Program_set_pid_DOC},
+	{"modules", (PyCFunction)Program_modules, METH_NOARGS,
+	 drgn_Program_modules_DOC},
+	{"loaded_modules", (PyCFunction)Program_loaded_modules, METH_NOARGS,
+	 drgn_Program_loaded_modules_DOC},
+	{"main_module", (PyCFunction)Program_main_module,
+	 METH_VARARGS | METH_KEYWORDS, drgn_Program_main_module_DOC},
+	{"shared_library_module", (PyCFunction)Program_shared_library_module,
+	 METH_VARARGS | METH_KEYWORDS, drgn_Program_shared_library_module_DOC},
+	{"vdso_module", (PyCFunction)Program_vdso_module,
+	 METH_VARARGS | METH_KEYWORDS, drgn_Program_vdso_module_DOC},
+	{"relocatable_module", (PyCFunction)Program_relocatable_module,
+	 METH_VARARGS | METH_KEYWORDS, drgn_Program_relocatable_module_DOC},
+	{"linux_kernel_loadable_module",
+	 (PyCFunction)Program_linux_kernel_loadable_module,
+	 METH_VARARGS | METH_KEYWORDS,
+	 drgn_Program_linux_kernel_loadable_module_DOC},
+	{"extra_module", (PyCFunction)Program_extra_module,
+	 METH_VARARGS | METH_KEYWORDS, drgn_Program_extra_module_DOC},
+	{"module", (PyCFunction)Program_module, METH_O,
+	 drgn_Program_module_DOC},
 	{"load_debug_info", (PyCFunction)Program_load_debug_info,
 	 METH_VARARGS | METH_KEYWORDS, drgn_Program_load_debug_info_DOC},
 	{"load_default_debug_info",
 	 (PyCFunction)Program_load_default_debug_info, METH_NOARGS,
 	 drgn_Program_load_default_debug_info_DOC},
+	{"load_module_debug_info", (PyCFunction)Program_load_module_debug_info,
+	 METH_VARARGS, drgn_Program_load_module_debug_info_DOC},
 	{"__getitem__", (PyCFunction)Program_subscript, METH_O | METH_COEXIST,
 	 drgn_Program___getitem___DOC},
 	{"__contains__", (PyCFunction)Program_contains, METH_O | METH_COEXIST,
@@ -1249,6 +2060,8 @@ static PyGetSetDef Program_getset[] = {
 	 drgn_Program_platform_DOC},
 	{"language", (getter)Program_get_language, (setter)Program_set_language,
 	 drgn_Program_language_DOC},
+	{"debug_info_path", (getter)Program_get_debug_info_path,
+	 (setter)Program_set_debug_info_path, drgn_Program_debug_info_path_DOC},
 	{},
 };
 
@@ -1281,7 +2094,7 @@ Program *program_from_core_dump(PyObject *self, PyObject *args, PyObject *kwds)
 {
 	static char *keywords[] = {"path", NULL};
 	struct drgn_error *err;
-	struct path_arg path = { .allow_fd = true };
+	PATH_ARG(path, .allow_fd = true);
 	if (!PyArg_ParseTupleAndKeywords(args, kwds,
 					 "O&:program_from_core_dump", keywords,
 					 path_converter, &path))
@@ -1289,16 +2102,13 @@ Program *program_from_core_dump(PyObject *self, PyObject *args, PyObject *kwds)
 
 	_cleanup_pydecref_ Program *prog =
 		(Program *)PyObject_CallObject((PyObject *)&Program_type, NULL);
-	if (!prog) {
-		path_cleanup(&path);
+	if (!prog)
 		return NULL;
-	}
 
 	if (path.fd >= 0)
 		err = drgn_program_init_core_dump_fd(&prog->prog, path.fd);
 	else
 		err = drgn_program_init_core_dump(&prog->prog, path.path);
-	path_cleanup(&path);
 	if (err)
 		return set_drgn_error(err);
 	return_ptr(prog);
