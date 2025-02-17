@@ -1,16 +1,18 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
+import enum
 import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import signal
 import socket
 import subprocess
 import sys
 import tempfile
-from typing import Optional
+from typing import Any, Optional, Sequence
 
 from util import nproc, out_of_date
 from vmtest.config import HOST_ARCHITECTURE, Kernel, local_kernel
@@ -20,6 +22,7 @@ from vmtest.download import (
     download,
     download_kernel_argparse_type,
 )
+from vmtest.kmod import build_kmod
 
 # Script run as init in the virtual machine.
 _INIT_TEMPLATE = r"""#!/bin/sh
@@ -83,14 +86,12 @@ mount -t tmpfs -o nosuid,nodev tmpfs /tmp/merged/tmp
 # Pivot into the new root.
 pivot_root /tmp/merged /tmp/merged/mnt
 cd /
-umount -l /mnt
+umount -n -l /mnt
 
 # Load kernel modules.
 mkdir -p "/lib/modules/$RELEASE"
 mount --bind {kernel_dir} "/lib/modules/$RELEASE"
-for module in configs rng_core virtio_rng; do
-	modprobe "$module"
-done
+modprobe -a rng_core virtio_rng
 
 # Create static device nodes.
 grep -v '^#' "/lib/modules/$RELEASE/modules.devname" |
@@ -138,7 +139,9 @@ if [ -z "$vport" ]; then
 fi
 
 cd {cwd}
+{test_kmod}
 set +e
+{stty}
 setsid -c sh -c {command}
 rc=$?
 set -e
@@ -192,18 +195,33 @@ def _build_onoatimehack(dir: Path) -> Path:
     return onoatimehack_so
 
 
+class TestKmodMode(enum.Enum):
+    NONE = 0
+    BUILD = 1
+    INSERT = 2
+
+
 class LostVMError(Exception):
     pass
 
 
 def run_in_vm(
-    command: str, kernel: Kernel, root_dir: Optional[Path], build_dir: Path
+    command: str,
+    kernel: Kernel,
+    root_dir: Optional[Path],
+    build_dir: Path,
+    *,
+    extra_qemu_options: Sequence[str] = (),
+    test_kmod: TestKmodMode = TestKmodMode.NONE,
 ) -> int:
     if root_dir is None:
         if kernel.arch is HOST_ARCHITECTURE:
             root_dir = Path("/")
         else:
             root_dir = build_dir / kernel.arch.name / "rootfs"
+
+    if test_kmod != TestKmodMode.NONE:
+        kmod = build_kmod(build_dir, kernel)
 
     qemu_exe = "qemu-system-" + kernel.arch.name
     match = re.search(
@@ -269,6 +287,21 @@ def run_in_vm(
             init = f'/bin/sh -- -c "/bin/mount -t tmpfs tmpfs /tmp && /bin/mkdir /tmp/host && /bin/mount -t 9p -o {_9pfs_mount_options},ro host /tmp/host && . /tmp/host{init_path.resolve()}"'
             host_dir_prefix = "/host"
 
+        if test_kmod == TestKmodMode.NONE:
+            test_kmod_command = ""
+        else:
+            test_kmod_command = f"export DRGN_TEST_KMOD={shlex.quote(host_dir_prefix + str(kmod.resolve()))}"
+            if test_kmod == TestKmodMode.INSERT:
+                test_kmod_command += '\ninsmod "$DRGN_TEST_KMOD"'
+
+        terminal_size = shutil.get_terminal_size((0, 0))
+        if terminal_size.columns or terminal_size.lines:
+            stty_command = (
+                f"stty cols {terminal_size.columns} rows {terminal_size.lines}"
+            )
+        else:
+            stty_command = ""
+
         with init_path.open("w") as init_file:
             init_file.write(
                 _INIT_TEMPLATE.format(
@@ -278,6 +311,8 @@ def run_in_vm(
                     ),
                     command=shlex.quote(command),
                     kdump_needs_nosmp="" if kvm_args else "export KDUMP_NEEDS_NOSMP=1",
+                    test_kmod=test_kmod_command,
+                    stty=stty_command,
                 )
             )
         init_path.chmod(0o755)
@@ -322,6 +357,8 @@ def run_in_vm(
                 "-kernel", str(kernel.path / "vmlinuz"),
                 "-append",
                 f"rootfstype=9p rootflags={_9pfs_mount_options} ro console={kernel.arch.qemu_console},115200 panic=-1 crashkernel=256M init={init}",
+
+                *extra_qemu_options,
                 # fmt: on
             ],
             env=env,
@@ -366,6 +403,16 @@ if __name__ == "__main__":
         format="%(asctime)s:%(levelname)s:%(name)s:%(message)s", level=logging.INFO
     )
 
+    class _StringSplitExtendAction(argparse.Action):
+        def __call__(
+            self, parser: Any, namespace: Any, values: Any, option_string: Any = None
+        ) -> None:
+            items = getattr(namespace, self.dest, None)
+            if items is None:
+                setattr(namespace, self.dest, values.split())
+            else:
+                items.extend(values.split())
+
     parser = argparse.ArgumentParser(
         description="run vmtest virtual machine",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -404,6 +451,37 @@ if __name__ == "__main__":
         help="directory to use as root directory in VM (default: / for the host architecture, $directory/$arch/rootfs otherwise)",
     )
     parser.add_argument(
+        "--qemu-options",
+        metavar="OPTIONS",
+        action=_StringSplitExtendAction,
+        default=argparse.SUPPRESS,
+        help="additional options to pass to QEMU, split on spaces. May be given multiple times",
+    )
+    parser.add_argument(
+        "-Xqemu",
+        metavar="OPTION",
+        action="append",
+        dest="qemu_options",
+        default=argparse.SUPPRESS,
+        help="additional option to pass to QEMU (not split on spaces). May be given multiple times",
+    )
+    parser.add_argument(
+        "--build-test-kmod",
+        dest="test_kmod",
+        action="store_const",
+        const=TestKmodMode.BUILD,
+        default=argparse.SUPPRESS,
+        help="build the drgn test kernel module and define the DRGN_TEST_KMOD environment variable in the VM",
+    )
+    parser.add_argument(
+        "--insert-test-kmod",
+        dest="test_kmod",
+        action="store_const",
+        const=TestKmodMode.INSERT,
+        default=argparse.SUPPRESS,
+        help="insert the drgn test kernel module. Implies --build-test-kmod",
+    )
+    parser.add_argument(
         "command",
         type=str,
         nargs=argparse.REMAINDER,
@@ -414,12 +492,17 @@ if __name__ == "__main__":
     if not hasattr(args, "kernel"):
         assert HOST_ARCHITECTURE is not None
         args.kernel = DownloadKernel(HOST_ARCHITECTURE, "*")
+    if not hasattr(args, "root_directory"):
+        args.root_directory = None
+    if not hasattr(args, "qemu_options"):
+        args.qemu_options = []
+    if not hasattr(args, "test_kmod"):
+        args.test_kmod = TestKmodMode.NONE
+
     if args.kernel.pattern.startswith(".") or args.kernel.pattern.startswith("/"):
         kernel = local_kernel(args.kernel.arch, Path(args.kernel.pattern))
     else:
         kernel = next(download(args.directory, [args.kernel]))  # type: ignore[assignment]
-    if not hasattr(args, "root_directory"):
-        args.root_directory = None
 
     try:
         command = (
@@ -427,7 +510,16 @@ if __name__ == "__main__":
             if args.command
             else "sh -i"
         )
-        sys.exit(run_in_vm(command, kernel, args.root_directory, args.directory))
+        sys.exit(
+            run_in_vm(
+                command,
+                kernel,
+                args.root_directory,
+                args.directory,
+                extra_qemu_options=args.qemu_options,
+                test_kmod=args.test_kmod,
+            )
+        )
     except LostVMError as e:
         print("error:", e, file=sys.stderr)
         sys.exit(args.lost_status)

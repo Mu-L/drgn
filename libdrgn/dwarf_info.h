@@ -21,7 +21,7 @@
 #include <elfutils/libdw.h>
 
 #include "cfi.h"
-#include "drgn.h"
+#include "drgn_internal.h"
 #include "hash_table.h"
 #include "vector.h"
 
@@ -189,10 +189,9 @@ struct drgn_dwarf_info {
 	 */
 	struct drgn_dwarf_base_type_map base_types;
 	/**
-	 * Map from the address of a (usually non-defining) DIE to the address
-	 * of a DIE with a DW_AT_specification attribute that references it.
-	 * This is used to resolve DIEs with DW_AT_declaration to their
-	 * definition.
+	 * Map from the address of a DIE to the address of a top-level DIE with
+	 * a `DW_AT_specification` or `DW_AT_abstract_origin` attribute that
+	 * refers to it.
 	 */
 	struct drgn_dwarf_specification_map specifications;
 	/** Indexed compilation units. */
@@ -212,47 +211,12 @@ struct drgn_dwarf_info {
 	 * See @ref drgn_type_from_dwarf_internal().
 	 */
 	struct drgn_dwarf_type_map cant_be_incomplete_array_types;
-
-	/** Current parsing recursion depth. */
-	int depth;
 };
 
 void drgn_dwarf_info_init(struct drgn_debug_info *dbinfo);
 void drgn_dwarf_info_deinit(struct drgn_debug_info *dbinfo);
 
-/**
- * State tracked while indexing new DWARF information in a @ref drgn_dwarf_info.
- */
-struct drgn_dwarf_index_state {
-	struct drgn_debug_info *dbinfo;
-	/** Per-thread arrays of CUs to be indexed. */
-	struct drgn_dwarf_index_cu_vector *cus;
-};
-
-/**
- * Initialize state for indexing new DWARF information.
- *
- * @return @c true on success, @c false on failure to allocate memory.
- */
-bool drgn_dwarf_index_state_init(struct drgn_dwarf_index_state *state,
-				 struct drgn_debug_info *dbinfo);
-
-/** Deinitialize state for indexing new DWARF information. */
-void drgn_dwarf_index_state_deinit(struct drgn_dwarf_index_state *state);
-
-/** Read a @ref drgn_elf_file to index its DWARF information. */
-struct drgn_error *
-drgn_dwarf_index_read_file(struct drgn_dwarf_index_state *state,
-			   struct drgn_elf_file *file);
-
-/**
- * Index new DWARF information.
- *
- * This should be called once all files have been read with @ref
- * drgn_dwarf_index_read_file() to finish indexing those files.
- */
-struct drgn_error *
-drgn_dwarf_info_update_index(struct drgn_dwarf_index_state *state);
+struct drgn_error *drgn_dwarf_info_update_index(struct drgn_debug_info *dbinfo);
 
 /**
  * Find the DWARF DIEs in a @ref drgn_module for the scope containing a given
@@ -341,10 +305,14 @@ drgn_object_from_dwarf(struct drgn_debug_info *dbinfo,
 		       const struct drgn_register_state *regs,
 		       struct drgn_object *ret);
 
+struct drgn_error *drgn_module_parse_debug_frame(struct drgn_module *module);
+
 struct drgn_error *
 drgn_module_find_dwarf_cfi(struct drgn_module *module, uint64_t pc,
 			   struct drgn_cfi_row **row_ret, bool *interrupted_ret,
 			   drgn_register_number *ret_addr_regno_ret);
+
+struct drgn_error *drgn_module_parse_eh_frame(struct drgn_module *module);
 
 struct drgn_error *
 drgn_module_find_eh_cfi(struct drgn_module *module, uint64_t pc,

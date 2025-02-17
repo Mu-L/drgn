@@ -9,6 +9,8 @@ The ``drgn.helpers.common.stack`` module provides helpers for working with
 stack traces.
 """
 
+from typing import Any, Dict
+
 from drgn import FaultError, PlatformFlags, StackTrace
 from drgn.helpers.common.memory import identify_address
 
@@ -22,6 +24,9 @@ def print_annotated_stack(trace: StackTrace) -> None:
 
     Currently, this will identify any addresses on the stack with
     :func:`~drgn.helpers.common.memory.identify_address()`.
+
+    See :func:`~drgn.helpers.common.memory.print_annotated_memory()` for a
+    similar function that annotates arbitrary memory ranges.
 
     >>> print_annotated_stack(stack_trace(1))
     STACK POINTER     VALUE
@@ -62,6 +67,7 @@ def print_annotated_stack(trace: StackTrace) -> None:
         line_format = "{:08x}: {:08x}{}"
         print("STACK     VALUE\nPOINTER")
 
+    cache: Dict[Any, Any] = {}
     start = 0
     while start < len(trace):
         # Find the bounds of this stack. Our heuristics for the end of the
@@ -123,7 +129,7 @@ def print_annotated_stack(trace: StackTrace) -> None:
                 print(f"[stack frame {frame}]")
                 frame_ind += 1
 
-            identified = identify_address(prog, word_val)
+            identified = identify_address(prog, word_val, cache=cache)
             if identified is None:
                 identified = ""
             else:

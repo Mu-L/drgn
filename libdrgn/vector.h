@@ -367,8 +367,9 @@ static bool vector##_empty(const struct vector *vector)				\
 }										\
 										\
 static const vector##_size_type vector##_max_size =				\
-	min_iconst(PTRDIFF_MAX, (vector##_size_type)-1)				\
-	/ sizeof(vector##_entry_type);						\
+	/* The redundant cast works around llvm/llvm-project#38137. */		\
+	(vector##_size_type)min_iconst(PTRDIFF_MAX / sizeof(vector##_entry_type),\
+				       (vector##_size_type)-1);			\
 										\
 static vector##_size_type vector##_capacity(const struct vector *vector)	\
 {										\
@@ -592,6 +593,14 @@ DEFINE_VECTOR_FUNCTIONS(vector)
  * @sa vector_init()
  */
 #define VECTOR_INIT { { 0 } }
+
+/**
+ * Define and initialize an empty @ref vector of type @p vector_type named @p
+ * vector that is automatically deinitialized when it goes out of scope.
+ */
+#define VECTOR(vector_type, vector)				\
+	__attribute__((__cleanup__(vector_type##_deinit)))	\
+	struct vector_type vector = VECTOR_INIT
 
 /**
  * Iterate over every entry in a @ref vector.

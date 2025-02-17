@@ -1,7 +1,6 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
-#include <elfutils/libdwfl.h>
 #include <limits.h>
 
 #include "debug_info.h"
@@ -65,6 +64,13 @@ static void drgn_register_state_set_known(struct drgn_register_state *regs,
 	bitset[i / CHAR_BIT] |= 1 << (i % CHAR_BIT);
 }
 
+static void drgn_register_state_set_unknown(struct drgn_register_state *regs,
+					    uint32_t i)
+{
+	unsigned char *bitset = drgn_register_state_known_bitset(regs);
+	bitset[i / CHAR_BIT] &= ~(1 << (i % CHAR_BIT));
+}
+
 bool drgn_register_state_has_register(const struct drgn_register_state *regs,
 				      drgn_register_number regno)
 {
@@ -90,6 +96,13 @@ drgn_register_state_set_has_register_range(struct drgn_register_state *regs,
 		drgn_register_state_set_known(regs, regno + 2);
 }
 
+void drgn_register_state_unset_has_register(struct drgn_register_state *regs,
+					    drgn_register_number regno)
+{
+	if (regno < regs->num_regs)
+		drgn_register_state_set_unknown(regs, (uint32_t)regno + 2);
+}
+
 struct optional_uint64
 drgn_register_state_get_pc(const struct drgn_register_state *regs)
 {
@@ -105,14 +118,8 @@ void drgn_register_state_set_pc(struct drgn_program *prog,
 	pc &= drgn_platform_address_mask(&prog->platform);
 	regs->_pc = pc;
 	drgn_register_state_set_known(regs, 0);
-	Dwfl_Module *dwfl_module = dwfl_addrmodule(prog->dbinfo.dwfl,
+	regs->module = drgn_module_find_by_address(prog,
 						   pc - !regs->interrupted);
-	if (dwfl_module) {
-		void **userdatap;
-		dwfl_module_info(dwfl_module, &userdatap, NULL, NULL,
-				 NULL, NULL, NULL, NULL);
-		regs->module = *userdatap;
-	}
 }
 
 struct optional_uint64

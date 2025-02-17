@@ -1,7 +1,6 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
-#include <byteswap.h>
 #include <dirent.h>
 #include <elf.h>
 #include <elfutils/libdwelf.h>
@@ -10,6 +9,7 @@
 #include <gelf.h>
 #include <inttypes.h>
 #include <libelf.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,15 +17,20 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "array.h"
 #include "binary_buffer.h"
 #include "cleanup.h"
 #include "debug_info.h"
-#include "drgn.h"
+#include "drgn_internal.h"
+#include "elf_file.h"
+#include "elf_notes.h"
 #include "error.h"
 #include "hash_table.h"
 #include "helpers.h"
+#include "hexlify.h"
 #include "io.h"
 #include "linux_kernel.h"
+#include "log.h"
 #include "platform.h"
 #include "program.h"
 #include "type.h"
@@ -381,627 +386,17 @@ static struct drgn_error *linux_kernel_get_vmemmap(struct drgn_program *prog,
 
 #include "linux_kernel_object_find.inc" // IWYU pragma: keep
 
-struct kernel_module_iterator {
-	char *name;
-	uint64_t start, end;
-	void *build_id_buf;
-	size_t build_id_buf_capacity;
-	/* `struct module` type. */
-	struct drgn_qualified_type module_type;
-	/* Current `struct module` (not a pointer). */
-	struct drgn_object mod;
-	/* `struct list_head *` in next module to return. */
-	struct drgn_object node;
-	/* Temporary objects reused for various purposes. */
-	struct drgn_object tmp1, tmp2, tmp3;
-	/* Address of `struct list_head modules`. */
-	uint64_t head;
-	bool use_sys_module;
-	bool use_sys_module_sections;
-};
-
-static void kernel_module_iterator_deinit(struct kernel_module_iterator *it)
-{
-	drgn_object_deinit(&it->tmp3);
-	drgn_object_deinit(&it->tmp2);
-	drgn_object_deinit(&it->tmp1);
-	drgn_object_deinit(&it->node);
-	drgn_object_deinit(&it->mod);
-	free(it->build_id_buf);
-	free(it->name);
-}
-
-static struct drgn_error *
-kernel_module_iterator_init(struct kernel_module_iterator *it,
-			    struct drgn_program *prog, bool use_sys_module)
+struct drgn_error *drgn_program_finish_set_kernel(struct drgn_program *prog)
 {
 	struct drgn_error *err;
-
-	it->name = NULL;
-	it->build_id_buf = NULL;
-	it->build_id_buf_capacity = 0;
-	it->use_sys_module = use_sys_module;
-	it->use_sys_module_sections = use_sys_module;
-	err = drgn_program_find_type(prog, "struct module", NULL,
-				     &it->module_type);
+	const struct drgn_object_finder_ops ops = {
+		.find = linux_kernel_object_find,
+	};
+	err = drgn_program_register_object_finder(prog, "linux", &ops, prog, 0);
 	if (err)
 		return err;
-
-	drgn_object_init(&it->mod, prog);
-	drgn_object_init(&it->node, prog);
-	drgn_object_init(&it->tmp1, prog);
-	drgn_object_init(&it->tmp2, prog);
-	drgn_object_init(&it->tmp3, prog);
-
-	err = drgn_program_find_object(prog, "modules", NULL,
-				       DRGN_FIND_OBJECT_VARIABLE, &it->node);
-	if (err)
-		goto err;
-	if (it->node.kind != DRGN_OBJECT_REFERENCE) {
-		err = drgn_error_create(DRGN_ERROR_OTHER,
-					"can't get address of modules list");
-	      goto err;
-	}
-	it->head = it->node.address;
-	err = drgn_object_member(&it->node, &it->node, "next");
-	if (err)
-		goto err;
-	err = drgn_object_read(&it->node, &it->node);
-	if (err)
-		goto err;
-
-	return NULL;
-
-err:
-	kernel_module_iterator_deinit(it);
-	return err;
-}
-
-/**
- * Get the the next loaded kernel module.
- *
- * After this is called, @c it->name is set to the name of the kernel module,
- * and @c it->start and @c it->end are set to the address range of the kernel
- * module. These are valid until the next time this is called or the iterator is
- * destroyed.
- *
- * @return @c NULL on success, non-@c NULL on error. In particular, when there
- * are no more modules, returns &@ref drgn_stop.
- */
-static struct drgn_error *
-kernel_module_iterator_next(struct kernel_module_iterator *it)
-{
-	struct drgn_error *err;
-
-	uint64_t addr;
-	err = drgn_object_read_unsigned(&it->node, &addr);
-	if (err)
-		return err;
-	if (addr == it->head)
-		return &drgn_stop;
-
-	err = drgn_object_container_of(&it->mod, &it->node, it->module_type,
-				       "list");
-	if (err)
-		return err;
-	err = drgn_object_dereference(&it->mod, &it->mod);
-	if (err)
-		return err;
-	// We need several fields from the `struct module`. Especially for
-	// /proc/kcore, it is faster to read the entire structure (which is <1kB
-	// as of Linux 6.0) from the core dump all at once than it is to read
-	// each field individually.
-	err = drgn_object_read(&it->mod, &it->mod);
-	if (err)
-		return err;
-	err = drgn_object_member(&it->node, &it->mod, "list");
-	if (err)
-		return err;
-	err = drgn_object_member(&it->node, &it->node, "next");
-	if (err)
-		return err;
-
-	// Set tmp1 to the module base address and tmp2 to the size.
-	err = drgn_object_member(&it->tmp1, &it->mod, "mem");
-	if (!err) {
-		union drgn_value mod_mem_type;
-
-		// Since Linux kernel commit ac3b43283923 ("module: replace
-		// module_layout with module_memory") (in v6.4), the base and
-		// size are in the `struct module_memory mem[MOD_TEXT]` member
-		// of `struct module`.
-		err = drgn_program_find_object(drgn_object_program(&it->mod),
-					       "MOD_TEXT", NULL,
-					       DRGN_FIND_OBJECT_CONSTANT,
-					       &it->tmp2);
-		if (err)
-			return err;
-		err = drgn_object_read_integer(&it->tmp2, &mod_mem_type);
-		if (err)
-			return err;
-
-		err = drgn_object_subscript(&it->tmp1, &it->tmp1,
-					    mod_mem_type.uvalue);
-		if (err)
-			return err;
-		err = drgn_object_member(&it->tmp2, &it->tmp1, "size");
-		if (err)
-			return err;
-		err = drgn_object_member(&it->tmp1, &it->tmp1, "base");
-		if (err)
-			return err;
-	} else if (err->code == DRGN_ERROR_LOOKUP) {
-		// Since Linux kernel commit 7523e4dc5057 ("module: use a
-		// structure to encapsulate layout.") (in v4.5), the base and
-		// size are in the `struct module_layout core_layout` member of
-		// `struct module`.
-		drgn_error_destroy(err);
-
-		err = drgn_object_member(&it->tmp1, &it->mod, "core_layout");
-		if (!err) {
-			err = drgn_object_member(&it->tmp2, &it->tmp1, "size");
-			if (err)
-				return err;
-			err = drgn_object_member(&it->tmp1, &it->tmp1, "base");
-			if (err)
-				return err;
-		} else if (err->code == DRGN_ERROR_LOOKUP) {
-			// Before that, they are directly in the `struct
-			// module`.
-			drgn_error_destroy(err);
-
-			err = drgn_object_member(&it->tmp2, &it->mod,
-						 "core_size");
-			if (err)
-				return err;
-			err = drgn_object_member(&it->tmp1, &it->mod,
-						 "module_core");
-			if (err)
-				return err;
-		} else {
-			return err;
-		}
-	} else {
-		return err;
-	}
-	err = drgn_object_read_unsigned(&it->tmp1, &it->start);
-	if (err)
-		return err;
-	err = drgn_object_read_unsigned(&it->tmp2, &it->end);
-	if (err)
-		return err;
-	it->end += it->start;
-
-	err = drgn_object_member(&it->tmp2, &it->mod, "name");
-	if (err)
-		return err;
-	char *name;
-	err = drgn_object_read_c_string(&it->tmp2, &name);
-	if (err)
-		return err;
-	free(it->name);
-	it->name = name;
-	return NULL;
-}
-
-static size_t parse_gnu_build_id_from_note(const void *note, size_t note_size,
-					   bool bswap, const void **ret)
-{
-	const char *p = note;
-	const char *end = p + note_size;
-	// Elf64_Nhdr is the same as Elf32_Nhdr.
-	Elf32_Nhdr nhdr;
-	while (end - p >= sizeof(nhdr)) {
-#define ALIGN_NOTE() do {						\
-		size_t to_align = (size_t)-(p - (char *)note) % 4;	\
-		if (to_align > end - p)					\
-			break;						\
-		p += to_align;						\
-} while (0)
-
-		memcpy(&nhdr, p, sizeof(nhdr));
-		if (bswap) {
-			nhdr.n_namesz = bswap_32(nhdr.n_namesz);
-			nhdr.n_descsz = bswap_32(nhdr.n_descsz);
-			nhdr.n_type = bswap_32(nhdr.n_type);
-		}
-		p += sizeof(nhdr);
-
-		if (nhdr.n_namesz > end - p)
-			break;
-		const char *name = p;
-		p += nhdr.n_namesz;
-		ALIGN_NOTE();
-
-		if (nhdr.n_namesz == sizeof("GNU") &&
-		    memcmp(name, "GNU", sizeof("GNU")) == 0 &&
-		    nhdr.n_type == NT_GNU_BUILD_ID &&
-		    nhdr.n_descsz > 0) {
-			if (nhdr.n_descsz > end - p)
-				break;
-			*ret = p;
-			return nhdr.n_descsz;
-		}
-
-		p += nhdr.n_descsz;
-		ALIGN_NOTE();
-
-#undef ALIGN_NOTE
-	}
-	*ret = NULL;
-	return 0;
-}
-
-static struct drgn_error *
-kernel_module_iterator_gnu_build_id_live(struct kernel_module_iterator *it,
-					 const void **build_id_ret,
-					 size_t *build_id_len_ret)
-{
-	struct drgn_error *err;
-
-	char *path;
-	if (asprintf(&path, "/sys/module/%s/notes", it->name) == -1)
-		return &drgn_enomem;
-	DIR *dir = opendir(path);
-	if (!dir) {
-		err = drgn_error_create_os("opendir", errno, path);
-		goto out_path;
-	}
-
-	struct dirent *ent;
-	while ((errno = 0, ent = readdir(dir))) {
-		if (ent->d_type == DT_DIR)
-			continue;
-
-		int fd = openat(dirfd(dir), ent->d_name, O_RDONLY);
-		if (fd == -1) {
-			err = drgn_error_format_os("openat", errno, "%s/%s",
-						   path, ent->d_name);
-			goto out;
-		}
-
-		struct stat st;
-		if (fstat(fd, &st) < 0) {
-			err = drgn_error_format_os("fstat", errno, "%s/%s",
-						   path, ent->d_name);
-			close(fd);
-			goto out;
-		}
-
-		if (st.st_size > SIZE_MAX ||
-		    !alloc_or_reuse(&it->build_id_buf,
-				    &it->build_id_buf_capacity, st.st_size)) {
-			err = &drgn_enomem;
-			close(fd);
-			goto out;
-		}
-
-		ssize_t r = read_all(fd, it->build_id_buf, st.st_size);
-		if (r < 0) {
-			err = drgn_error_format_os("read", errno, "%s/%s", path,
-						   ent->d_name);
-			close(fd);
-			goto out;
-		}
-		close(fd);
-
-		*build_id_len_ret =
-			parse_gnu_build_id_from_note(it->build_id_buf, r, false,
-						     build_id_ret);
-		if (*build_id_len_ret) {
-			err = NULL;
-			goto out;
-		}
-	}
-	if (errno) {
-		err = drgn_error_create_os("readdir", errno, path);
-	} else {
-		*build_id_ret = NULL;
-		*build_id_len_ret = 0;
-		err = NULL;
-	}
-
-out:
-	closedir(dir);
-out_path:
-	free(path);
-	return err;
-}
-
-static struct drgn_error *
-kernel_module_iterator_gnu_build_id(struct kernel_module_iterator *it,
-				    const void **build_id_ret,
-				    size_t *build_id_len_ret)
-{
-	if (it->use_sys_module) {
-		return kernel_module_iterator_gnu_build_id_live(it,
-								build_id_ret,
-								build_id_len_ret);
-	}
-
-	struct drgn_error *err;
-	struct drgn_program *prog = drgn_object_program(&it->mod);
-	const bool bswap = drgn_platform_bswap(&prog->platform);
-
-	DRGN_OBJECT(attrs, prog);
-	DRGN_OBJECT(attr, prog);
-	DRGN_OBJECT(tmp, prog);
-
-	// n = mod->notes_attrs->notes
-	uint64_t n;
-	err = drgn_object_member(&attrs, &it->mod, "notes_attrs");
-	if (err)
-		return err;
-	err = drgn_object_member_dereference(&tmp, &attrs, "notes");
-	if (err)
-		return err;
-	err = drgn_object_read_unsigned(&tmp, &n);
-	if (err)
-		return err;
-
-	// attrs = mod->notes_attrs->attrs
-	err = drgn_object_member_dereference(&attrs, &attrs, "attrs");
-	if (err)
-		return err;
-
-	for (uint64_t i = 0; i < n; i++) {
-		// attr = attrs[i]
-		err = drgn_object_subscript(&attr, &attrs, i);
-		if (err)
-			return err;
-
-		// address = attr.private
-		err = drgn_object_member(&tmp, &attr, "private");
-		if (err)
-			return err;
-		uint64_t address;
-		err = drgn_object_read_unsigned(&tmp, &address);
-		if (err)
-			return err;
-
-		// size = attr.size
-		err = drgn_object_member(&tmp, &attr, "size");
-		if (err)
-			return err;
-		uint64_t size;
-		err = drgn_object_read_unsigned(&tmp, &size);
-		if (err)
-			return err;
-
-		if (size > SIZE_MAX ||
-		    !alloc_or_reuse(&it->build_id_buf,
-				    &it->build_id_buf_capacity, size))
-			return &drgn_enomem;
-
-		err = drgn_program_read_memory(prog, it->build_id_buf, address,
-					       size, false);
-		if (err)
-			return err;
-
-		*build_id_len_ret =
-			parse_gnu_build_id_from_note(it->build_id_buf, size,
-						     bswap, build_id_ret);
-		if (*build_id_len_ret)
-			return NULL;
-	}
-	*build_id_ret = NULL;
-	*build_id_len_ret = 0;
-	return NULL;
-}
-
-struct kernel_module_section_iterator {
-	struct kernel_module_iterator *kmod_it;
-	bool yielded_percpu;
-	/* /sys/module/$module/sections directory or NULL. */
-	DIR *sections_dir;
-	/* If not using /sys/module/$module/sections. */
-	uint64_t i;
-	uint64_t nsections;
-	char *name;
-};
-
-static struct drgn_error *
-kernel_module_section_iterator_init_no_sys_module(struct kernel_module_section_iterator *it,
-						  struct kernel_module_iterator *kmod_it)
-{
-	struct drgn_error *err;
-
-	it->sections_dir = NULL;
-	it->i = 0;
-	it->name = NULL;
-	/* it->nsections = mod->sect_attrs->nsections */
-	err = drgn_object_member(&kmod_it->tmp1, &kmod_it->mod, "sect_attrs");
-	if (err)
-		return err;
-	err = drgn_object_member_dereference(&kmod_it->tmp2, &kmod_it->tmp1,
-					     "nsections");
-	if (err)
-		return err;
-	err = drgn_object_read_unsigned(&kmod_it->tmp2, &it->nsections);
-	if (err)
-		return err;
-	/* kmod_it->tmp1 = mod->sect_attrs->attrs */
-	return drgn_object_member_dereference(&kmod_it->tmp1, &kmod_it->tmp1,
-					      "attrs");
-}
-
-static struct drgn_error *
-kernel_module_section_iterator_init(struct kernel_module_section_iterator *it,
-				    struct kernel_module_iterator *kmod_it)
-{
-	it->kmod_it = kmod_it;
-	it->yielded_percpu = false;
-	if (kmod_it->use_sys_module_sections) {
-		char *path;
-		if (asprintf(&path, "/sys/module/%s/sections",
-			     kmod_it->name) == -1)
-			return &drgn_enomem;
-		it->sections_dir = opendir(path);
-		free(path);
-		if (!it->sections_dir) {
-			return drgn_error_format_os("opendir", errno,
-						    "/sys/module/%s/sections",
-						    kmod_it->name);
-		}
-		return NULL;
-	} else {
-		return kernel_module_section_iterator_init_no_sys_module(it, kmod_it);
-	}
-}
-
-static void
-kernel_module_section_iterator_deinit(struct kernel_module_section_iterator *it)
-{
-	if (it->sections_dir)
-		closedir(it->sections_dir);
-	else
-		free(it->name);
-}
-
-static struct drgn_error *
-kernel_module_section_iterator_next_live(struct kernel_module_section_iterator *it,
-					 const char **name_ret,
-					 uint64_t *address_ret)
-{
-	struct dirent *ent;
-	while ((errno = 0, ent = readdir(it->sections_dir))) {
-		if (ent->d_type == DT_DIR)
-			continue;
-		if (ent->d_type == DT_UNKNOWN) {
-			struct stat st;
-
-			if (fstatat(dirfd(it->sections_dir), ent->d_name, &st,
-				    0) == -1) {
-				return drgn_error_format_os("fstatat", errno,
-							    "/sys/module/%s/sections/%s",
-							    it->kmod_it->name,
-							    ent->d_name);
-			}
-			if (S_ISDIR(st.st_mode))
-				continue;
-		}
-
-		int fd = openat(dirfd(it->sections_dir), ent->d_name, O_RDONLY);
-		if (fd == -1) {
-			return drgn_error_format_os("openat", errno,
-						    "/sys/module/%s/sections/%s",
-						    it->kmod_it->name,
-						    ent->d_name);
-		}
-		FILE *file = fdopen(fd, "r");
-		if (!file) {
-			close(fd);
-			return drgn_error_create_os("fdopen", errno, NULL);
-		}
-		int ret = fscanf(file, "%" SCNx64, address_ret);
-		fclose(file);
-		if (ret != 1) {
-			return drgn_error_format(DRGN_ERROR_OTHER,
-						 "could not parse /sys/module/%s/sections/%s",
-						 it->kmod_it->name,
-						 ent->d_name);
-		}
-		*name_ret = ent->d_name;
-		return NULL;
-	}
-	if (errno) {
-		return drgn_error_format_os("readdir", errno,
-					    "/sys/module/%s/sections",
-					    it->kmod_it->name);
-	} else {
-		return &drgn_stop;
-	}
-}
-
-static struct drgn_error *
-kernel_module_section_iterator_next(struct kernel_module_section_iterator *it,
-				    const char **name_ret,
-				    uint64_t *address_ret)
-{
-	struct drgn_error *err;
-	struct kernel_module_iterator *kmod_it = it->kmod_it;
-
-	// As of Linux 6.0, the .data..percpu section is not included in the
-	// section attributes. (kernel/module/sysfs.c:add_sect_attrs() only
-	// creates attributes for sections with the SHF_ALLOC flag set, but
-	// kernel/module/main.c:layout_and_allocate() clears the SHF_ALLOC flag
-	// for the .data..percpu section.) However, we need this address so that
-	// global per-CPU variables will be relocated correctly. Get it from
-	// `struct module`.
-	if (!it->yielded_percpu) {
-		it->yielded_percpu = true;
-		err = drgn_object_member(&kmod_it->tmp2, &kmod_it->mod,
-					 "percpu");
-		if (!err) {
-			err = drgn_object_read_unsigned(&kmod_it->tmp2, address_ret);
-			if (err)
-				return err;
-			// struct module::percpu is NULL if the module doesn't
-			// have any per-CPU data.
-			if (*address_ret) {
-				*name_ret = ".data..percpu";
-				return NULL;
-			}
-		} else if (err->code == DRGN_ERROR_LOOKUP) {
-			// struct module::percpu doesn't exist if !SMP.
-			drgn_error_destroy(err);
-		} else {
-			return err;
-		}
-	}
-
-	if (it->sections_dir) {
-		err = kernel_module_section_iterator_next_live(it, name_ret,
-							       address_ret);
-		if (err && err->code == DRGN_ERROR_OS && err->errnum == EACCES) {
-			closedir(it->sections_dir);
-			drgn_error_destroy(err);
-			it->kmod_it->use_sys_module_sections = false;
-			err = kernel_module_section_iterator_init_no_sys_module(it, it->kmod_it);
-			if (err)
-				return err;
-		} else {
-			return err;
-		}
-	}
-
-	if (it->i >= it->nsections)
-		return &drgn_stop;
-	err = drgn_object_subscript(&kmod_it->tmp2, &kmod_it->tmp1, it->i++);
-	if (err)
-		return err;
-	err = drgn_object_member(&kmod_it->tmp3, &kmod_it->tmp2, "address");
-	if (err)
-		return err;
-	err = drgn_object_read_unsigned(&kmod_it->tmp3, address_ret);
-	if (err)
-		return err;
-	/*
-	 * Since Linux kernel commit ed66f991bb19 ("module: Refactor section
-	 * attr into bin attribute") (in v5.8), the section name is
-	 * module_sect_attr.battr.attr.name. Before that, it is simply
-	 * module_sect_attr.name.
-	 */
-	err = drgn_object_member(&kmod_it->tmp2, &kmod_it->tmp2, "battr");
-	if (!err) {
-		err = drgn_object_member(&kmod_it->tmp2, &kmod_it->tmp2,
-					 "attr");
-		if (err)
-			return err;
-	} else {
-		if (err->code != DRGN_ERROR_LOOKUP)
-			return err;
-		drgn_error_destroy(err);
-	}
-	err = drgn_object_member(&kmod_it->tmp3, &kmod_it->tmp2, "name");
-	if (err)
-		return err;
-	char *name;
-	err = drgn_object_read_c_string(&kmod_it->tmp3, &name);
-	if (err)
-		return err;
-	free(it->name);
-	*name_ret = it->name = name;
+	if (!prog->lang)
+		prog->lang = &drgn_language_c;
 	return NULL;
 }
 
@@ -1018,15 +413,11 @@ kernel_module_section_iterator_next(struct kernel_module_section_iterator *it,
  * changes in the future, we can reevaluate this.
  */
 
-struct depmod_index {
-	void *addr;
-	size_t len;
-	char path[256];
-};
-
 static void depmod_index_deinit(struct depmod_index *depmod)
 {
-	munmap(depmod->addr, depmod->len);
+	if (depmod->len > 0)
+		munmap(depmod->addr, depmod->len);
+	free(depmod->path);
 }
 
 struct depmod_index_buffer {
@@ -1078,42 +469,31 @@ static struct drgn_error *depmod_index_validate(struct depmod_index *depmod)
 }
 
 static struct drgn_error *depmod_index_init(struct depmod_index *depmod,
-					    const char *osrelease)
+					    char *_path, int fd)
 {
 	struct drgn_error *err;
-
-	snprintf(depmod->path, sizeof(depmod->path),
-		 "/lib/modules/%s/modules.dep.bin", osrelease);
-
-	int fd = open(depmod->path, O_RDONLY);
-	if (fd == -1)
-		return drgn_error_create_os("open", errno, depmod->path);
+	_cleanup_free_ char *path = _path; // Take ownership of path.
 
 	struct stat st;
-	if (fstat(fd, &st) == -1) {
-		err = drgn_error_create_os("fstat", errno, depmod->path);
-		goto out;
-	}
+	if (fstat(fd, &st) == -1)
+		return drgn_error_create_os("fstat", errno, path);
 
-	if (st.st_size < 0 || st.st_size > SIZE_MAX) {
-		err = &drgn_enomem;
-		goto out;
-	}
+	if (st.st_size > SIZE_MAX)
+		return &drgn_enomem;
 
 	void *addr = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-	if (addr == MAP_FAILED) {
-		err = drgn_error_create_os("mmap", errno, depmod->path);
-		goto out;
-	}
+	if (addr == MAP_FAILED)
+		return drgn_error_create_os("mmap", errno, path);
 
+	depmod->path = no_cleanup_ptr(path);
 	depmod->addr = addr;
 	depmod->len = st.st_size;
-
 	err = depmod_index_validate(depmod);
-	if (err)
+	if (err) {
 		depmod_index_deinit(depmod);
-out:
-	close(fd);
+		depmod->path = NULL;
+		depmod->len = 0;
+	}
 	return err;
 }
 
@@ -1218,579 +598,1572 @@ not_found:
 	return NULL;
 }
 
-/*
- * Identify an ELF file as a kernel module, vmlinux, or neither. We classify a
- * file as a kernel module if it has a section named .gnu.linkonce.this_module.
- * If it doesn't, but it does have a section named .init.text, we classify it as
- * vmlinux.
- */
-static struct drgn_error *identify_kernel_elf(Elf *elf,
-					      bool *is_vmlinux_ret,
-					      bool *is_module_ret)
-{
-	size_t shstrndx;
-	if (elf_getshdrstrndx(elf, &shstrndx))
-		return drgn_error_libelf();
+DEFINE_VECTOR_FUNCTIONS(char_p_vector);
 
-	Elf_Scn *scn = NULL;
-	bool have_init_text = false;
-	while ((scn = elf_nextscn(elf, scn))) {
-		GElf_Shdr *shdr, shdr_mem;
-		const char *scnname;
+DEFINE_HASH_MAP_FUNCTIONS(drgn_kmod_walk_module_map, c_string_key_hash_pair,
+			  c_string_key_eq);
 
-		shdr = gelf_getshdr(scn, &shdr_mem);
-		if (!shdr)
-			continue;
-
-		scnname = elf_strptr(elf, shstrndx, shdr->sh_name);
-		if (!scnname)
-			return drgn_error_libelf();
-		if (strcmp(scnname, ".gnu.linkonce.this_module") == 0) {
-			*is_vmlinux_ret = false;
-			*is_module_ret = true;
-			return NULL;
-		} else if (strcmp(scnname, ".init.text") == 0) {
-			have_init_text = true;
-		}
-	}
-	*is_vmlinux_ret = have_init_text;
-	*is_module_ret = false;
-	return NULL;
-}
-
-DEFINE_HASH_MAP(elf_scn_name_map, const char *, Elf_Scn *,
-		c_string_key_hash_pair, c_string_key_eq);
-
-static struct drgn_error *
-cache_kernel_module_sections(struct kernel_module_iterator *kmod_it, Elf *elf)
-{
-	struct drgn_error *err;
-
-	size_t shstrndx;
-	if (elf_getshdrstrndx(elf, &shstrndx))
-		return drgn_error_libelf();
-
-	struct elf_scn_name_map scn_map = HASH_TABLE_INIT;
-	Elf_Scn *scn = NULL;
-	while ((scn = elf_nextscn(elf, scn))) {
-		GElf_Shdr shdr_mem;
-		GElf_Shdr *shdr = gelf_getshdr(scn, &shdr_mem);
-		if (!shdr) {
-			err = drgn_error_libelf();
-			goto out_scn_map;
-		}
-
-		if (!(shdr->sh_flags & SHF_ALLOC))
-			continue;
-
-		struct elf_scn_name_map_entry entry = {
-			.key = elf_strptr(elf, shstrndx, shdr->sh_name),
-			.value = scn,
-		};
-		if (!entry.key) {
-			err = drgn_error_libelf();
-			goto out_scn_map;
-		}
-
-		if (elf_scn_name_map_insert(&scn_map, &entry, NULL) == -1) {
-			err = &drgn_enomem;
-			goto out_scn_map;
-		}
-	}
-
-	struct kernel_module_section_iterator section_it;
-	err = kernel_module_section_iterator_init(&section_it, kmod_it);
-	if (err)
-		goto out_scn_map;
-	const char *name;
-	uint64_t address;
-	while (!(err = kernel_module_section_iterator_next(&section_it, &name,
-							   &address))) {
-		struct elf_scn_name_map_iterator it =
-			elf_scn_name_map_search(&scn_map, &name);
-		if (it.entry) {
-			GElf_Shdr shdr_mem;
-			GElf_Shdr *shdr = gelf_getshdr(it.entry->value,
-						       &shdr_mem);
-			if (!shdr) {
-				err = drgn_error_libelf();
-				break;
-			}
-			shdr->sh_addr = address;
-			if (!gelf_update_shdr(it.entry->value, shdr)) {
-				err = drgn_error_libelf();
-				break;
-			}
-		}
-	}
-	if (err && err != &drgn_stop)
-		goto out_section_it;
-	err = NULL;
-out_section_it:
-	kernel_module_section_iterator_deinit(&section_it);
-out_scn_map:
-	elf_scn_name_map_deinit(&scn_map);
-	return err;
-}
-
-struct kernel_module_file {
-	const char *path;
-	int fd;
-	Elf *elf;
-	/*
-	 * Kernel module build ID. This is owned by the Elf handle. Because we
-	 * use this as the key in the kernel_module_table, the file must always
-	 * be removed from the table before it is reported to the DWARF index
-	 * (which takes ownership of the Elf handle).
-	 */
-	const void *gnu_build_id;
-	size_t gnu_build_id_len;
-	/* Next file with the same build ID. */
-	struct kernel_module_file *next;
+struct drgn_kmod_walk_stack_entry {
+	DIR *dir;
+	size_t path_len;
 };
 
-static struct nstring
-kernel_module_table_key(struct kernel_module_file * const *entry)
+DEFINE_VECTOR_FUNCTIONS(drgn_kmod_walk_stack);
+
+static inline struct hash_pair
+drgn_kmod_walk_inode_hash_pair(const struct drgn_kmod_walk_inode *entry)
 {
-	return (struct nstring){
-		(*entry)->gnu_build_id, (*entry)->gnu_build_id_len
-	};
+	return hash_pair_from_avalanching_hash(hash_combine(entry->dev, entry->ino));
 }
 
-DEFINE_HASH_TABLE(kernel_module_table, struct kernel_module_file *,
-		  kernel_module_table_key, nstring_hash_pair, nstring_eq);
+static inline bool
+drgn_kmod_walk_inode_eq(const struct drgn_kmod_walk_inode *a,
+			const struct drgn_kmod_walk_inode *b)
+{
+	return a->dev == b->dev && a->ino == b->ino;
+}
+
+DEFINE_HASH_SET_FUNCTIONS(drgn_kmod_walk_inode_set,
+			  drgn_kmod_walk_inode_hash_pair,
+			  drgn_kmod_walk_inode_eq);
+
+static void
+drgn_kmod_walk_module_map_entry_deinit(struct drgn_kmod_walk_module_map_entry *entry)
+{
+	vector_for_each(char_p_vector, path, &entry->value)
+		free(*path);
+	char_p_vector_deinit(&entry->value);
+}
+
+static void
+drgn_kmod_walk_state_deinit(struct drgn_kmod_walk_state *state)
+{
+	drgn_kmod_walk_inode_set_deinit(&state->visited_dirs);
+	string_builder_deinit(&state->path);
+	vector_for_each(drgn_kmod_walk_stack, entry, &state->stack)
+		closedir(entry->dir);
+	drgn_kmod_walk_stack_deinit(&state->stack);
+	hash_table_for_each(drgn_kmod_walk_module_map, it, &state->modules)
+		drgn_kmod_walk_module_map_entry_deinit(it.entry);
+	drgn_kmod_walk_module_map_deinit(&state->modules);
+}
+
+void
+drgn_standard_debug_info_find_state_deinit(struct drgn_standard_debug_info_find_state *state)
+{
+	drgn_kmod_walk_state_deinit(&state->kmod_walk);
+	depmod_index_deinit(&state->modules_dep);
+}
 
 static struct drgn_error *
-report_loaded_kernel_module(struct drgn_debug_info_load_state *load,
-			    struct kernel_module_iterator *kmod_it,
-			    struct kernel_module_table *kmod_table)
+drgn_module_try_vmlinux_in_debug_directories(struct drgn_module *module,
+					     const struct drgn_debug_info_options *options,
+					     struct string_builder *sb)
 {
 	struct drgn_error *err;
-
-	struct nstring key;
-	err = kernel_module_iterator_gnu_build_id(kmod_it,
-						  (const void **)&key.str,
-						  &key.len);
-	if (err || key.len == 0) {
-		return drgn_debug_info_report_error(load, kmod_it->name,
-						    "could not find GNU build ID",
-						    err);
-	}
-
-	struct hash_pair hp = kernel_module_table_hash(&key);
-	struct kernel_module_table_iterator it =
-		kernel_module_table_search_hashed(kmod_table, &key, hp);
-	if (!it.entry)
-		return &drgn_not_found;
-
-	struct kernel_module_file *kmod = *it.entry;
-	kernel_module_table_delete_iterator_hashed(kmod_table, it, hp);
-	do {
-		err = cache_kernel_module_sections(kmod_it, kmod->elf);
-		if (err) {
-			err = drgn_debug_info_report_error(load, kmod->path,
-							   "could not get section addresses",
-							   err);
-			if (err)
+	// Paths relative to the debug directory where vmlinux might be
+	// installed.
+	static const char * const debug_dir_paths[] = {
+		// Debian, Ubuntu:
+		"/boot/vmlinux-%s",
+		// Fedora, CentOS:
+		"/lib/modules/%s/vmlinux",
+		// SUSE:
+		"/lib/modules/%s/vmlinux.debug",
+	};
+	for (size_t i = 0; options->directories[i]; i++) {
+		const char *debug_dir = options->directories[i];
+		if (debug_dir[0] != '/')
+			continue;
+		sb->len = 0;
+		if (!string_builder_append(sb, debug_dir))
+			return &drgn_enomem;
+		size_t debug_dir_len = sb->len;
+		array_for_each(format, debug_dir_paths) {
+			sb->len = debug_dir_len;
+			if (!string_builder_appendf(sb, *format,
+						    module->prog->vmcoreinfo.osrelease)
+			    || !string_builder_null_terminate(sb))
+				return &drgn_enomem;
+			err = drgn_module_try_standard_file(module, options,
+							    sb->str, -1, true,
+							    NULL);
+			if (err || !drgn_module_wants_file(module))
 				return err;
-			goto next;
+		}
+	}
+	return NULL;
+}
+
+struct drgn_error *
+drgn_module_try_vmlinux_files(struct drgn_module *module,
+			      const struct drgn_debug_info_options *options)
+{
+	struct drgn_error *err;
+	struct drgn_program *prog = module->prog;
+
+	const char *osrelease = prog->vmcoreinfo.osrelease;
+	STRING_BUILDER(sb);
+	for (size_t i = 0; options->kernel_directories[i]; i++) {
+		const char *kernel_dir = options->kernel_directories[i];
+
+		if (kernel_dir[0]) {
+			sb.len = 0;
+			if (!string_builder_append(&sb, kernel_dir))
+				return &drgn_enomem;
+		} else {
+			// Empty path. Try under the debug directories first.
+			err = drgn_module_try_vmlinux_in_debug_directories(module,
+									   options,
+									   &sb);
+			if (err || !drgn_module_wants_file(module))
+				return err;
+
+			// Try /boot/vmlinux-$osrelease.
+			sb.len = 0;
+			if (!string_builder_append(&sb, "/boot/vmlinux-")
+			    || !string_builder_append(&sb, osrelease)
+			    || !string_builder_null_terminate(&sb))
+				return &drgn_enomem;
+			err = drgn_module_try_standard_file(module, options,
+							    sb.str, -1, true,
+							    NULL);
+			if (err || !drgn_module_wants_file(module))
+				return err;
+
+			// Try /lib/modules/$osrelease as the kernel directory.
+			sb.len = 0;
+			if (!string_builder_append(&sb, "/lib/modules/")
+			    || !string_builder_append(&sb, osrelease))
+				return &drgn_enomem;
 		}
 
-		err = drgn_debug_info_report_elf(load, kmod->path, kmod->fd,
-						 kmod->elf, kmod_it->start,
-						 kmod_it->end, kmod_it->name,
-						 NULL);
-		kmod->elf = NULL;
-		kmod->fd = -1;
-		if (err)
-			return err;
-next:
-		kmod = kmod->next;
-	} while (kmod);
+		// Paths relative to the kernel directory where vmlinux might be
+		// installed.
+		static const char * const kernel_dir_paths[] = {
+			"/build/vmlinux",
+			"/vmlinux",
+		};
+		size_t kernel_dir_len = sb.len;
+		array_for_each(path, kernel_dir_paths) {
+			if (!string_builder_append(&sb, *path)
+			    || !string_builder_null_terminate(&sb))
+				return &drgn_enomem;
+			err = drgn_module_try_standard_file(module, options,
+							    sb.str, -1, true,
+							    NULL);
+			if (err || !drgn_module_wants_file(module))
+				return err;
+			sb.len = kernel_dir_len;
+		}
+	}
+
 	return NULL;
 }
 
 static struct drgn_error *
-report_default_kernel_module(struct drgn_debug_info_load_state *load,
-			     struct kernel_module_iterator *kmod_it,
-			     struct depmod_index *depmod)
+drgn_open_modules_dep(struct drgn_program *prog,
+		      const struct drgn_debug_info_options *options,
+		      struct depmod_index *modules_dep)
 {
-	static const char * const module_paths[] = {
-		"/usr/lib/debug/lib/modules/%s/%.*s",
-		"/usr/lib/debug/lib/modules/%s/%.*s.debug",
-		"/lib/modules/%s/%.*s%.*s",
-		NULL,
-	};
 	struct drgn_error *err;
+
+	if (modules_dep->addr)
+		return NULL;
+
+	STRING_BUILDER(sb);
+	_cleanup_close_ int fd = -1;
+	for (size_t i = 0; options->kernel_directories[i]; i++) {
+		const char *kernel_dir = options->kernel_directories[i];
+
+		sb.len = 0;
+		if (kernel_dir[0]) {
+			if (!string_builder_append(&sb, kernel_dir))
+				return &drgn_enomem;
+		} else {
+			// Empty path. Try /lib/modules/$osrelease.
+			if (!string_builder_append(&sb, "/lib/modules/")
+			    || !string_builder_append(&sb,
+						      prog->vmcoreinfo.osrelease))
+				return &drgn_enomem;
+		}
+		if (!string_builder_append(&sb, "/modules.dep.bin")
+		    || !string_builder_null_terminate(&sb))
+			return &drgn_enomem;
+		fd = open(sb.str, O_RDONLY);
+		if (fd >= 0)
+			break;
+		drgn_log_debug(prog, "%s: %m", sb.str);
+	}
+	if (fd < 0) {
+		drgn_log_debug(prog, "couldn't find depmod index");
+fail:
+		// Set addr so that we don't try again.
+		modules_dep->addr = MAP_FAILED;
+		return NULL;
+	}
+
+	err = depmod_index_init(modules_dep, string_builder_steal(&sb), fd);
+	if (err) {
+		if (drgn_error_is_fatal(err))
+			return err;
+		drgn_error_log_warning(prog, err,
+				       "couldn't open depmod index: ");
+		drgn_error_destroy(err);
+		goto fail;
+	}
+	drgn_log_debug(prog, "found depmod index %s", modules_dep->path);
+	return NULL;
+}
+
+static struct drgn_error *
+drgn_module_try_depmod_in_debug_directories(struct drgn_module *module,
+					    const struct drgn_debug_info_options *options,
+					    struct string_builder *sb,
+					    const char *depmod_path, size_t ko_len)
+{
+	struct drgn_error *err;
+	for (size_t i = 0; options->directories[i]; i++) {
+		const char *debug_dir = options->directories[i];
+		if (debug_dir[0] != '/')
+			continue;
+		sb->len = 0;
+		// Debian, Ubuntu:
+		// $debug_dir/lib/modules/$(uname -r)/$ko_name
+		if (!string_builder_append(sb, debug_dir)
+		    || !string_builder_append(sb, "/lib/modules/")
+		    || !string_builder_append(sb,
+					      module->prog->vmcoreinfo.osrelease)
+		    || !string_builder_appendc(sb, '/')
+		    || !string_builder_appendn(sb, depmod_path, ko_len)
+		    || !string_builder_null_terminate(sb))
+			return &drgn_enomem;
+		err = drgn_module_try_standard_file(module, options, sb->str,
+						    -1, true, NULL);
+		if (err || !drgn_module_wants_file(module))
+			return err;
+
+		// Fedora, CentOS, SUSE:
+		// $debug_dir/lib/modules/$(uname -r)/$ko_name.debug
+		if (!string_builder_append(sb, ".debug")
+		    || !string_builder_null_terminate(sb))
+			return &drgn_enomem;
+		err = drgn_module_try_standard_file(module, options, sb->str,
+						    -1, true, NULL);
+		if (err || !drgn_module_wants_file(module))
+			return err;
+	}
+	return NULL;
+}
+
+static struct drgn_error *
+drgn_module_try_linux_kmod_depmod(struct drgn_module *module,
+				  const struct drgn_debug_info_options *options,
+				  struct drgn_standard_debug_info_find_state *state)
+{
+	struct drgn_error *err;
+	struct drgn_program *prog = module->prog;
 
 	const char *depmod_path;
 	size_t depmod_path_len;
-	err = depmod_index_find(depmod, kmod_it->name, &depmod_path,
+	err = depmod_index_find(&state->modules_dep, module->name, &depmod_path,
 				&depmod_path_len);
 	if (err) {
-		return drgn_debug_info_report_error(load,
-						    "kernel modules",
-						    "could not parse depmod",
-						    err);
-	} else if (!depmod_path) {
-		return drgn_debug_info_report_error(load, kmod_it->name,
-						    "could not find module in depmod",
-						    NULL);
+		drgn_error_log_warning(prog, err,
+				       "couldn't parse depmod index: ");
+		drgn_error_destroy(err);
+		return NULL;
 	}
+	if (!depmod_path) {
+		drgn_log_debug(prog, "couldn't find %s in depmod index",
+			       module->name);
+		return NULL;
+	}
+	drgn_log_debug(prog, "found %.*s in depmod index",
+		       depmod_path_len > INT_MAX
+		       ? INT_MAX : (int)depmod_path_len,
+		       depmod_path);
 
-	size_t extension_len;
-	if (depmod_path_len >= 3 &&
-	    (memcmp(depmod_path + depmod_path_len - 3, ".gz", 3) == 0 ||
-	     memcmp(depmod_path + depmod_path_len - 3, ".xz", 3) == 0))
-		extension_len = 3;
+	// Get the length of the path with one extension after ".ko" removed if
+	// present (e.g., ".gz", ".xz", or ".zst").
+	const char *name = memrchr(depmod_path, '/', depmod_path_len);
+	if (name)
+		name = name + 1;
 	else
-		extension_len = 0;
-	char *path;
-	int fd;
-	Elf *elf;
-	err = find_elf_file(&path, &fd, &elf, module_paths,
-			    load->dbinfo->prog->vmcoreinfo.osrelease,
-			    depmod_path_len - extension_len, depmod_path,
-			    extension_len,
-			    depmod_path + depmod_path_len - extension_len);
-	if (err)
-		return drgn_debug_info_report_error(load, NULL, NULL, err);
-	if (!elf) {
-		return drgn_debug_info_report_error(load, kmod_it->name,
-						    "could not find .ko",
-						    NULL);
+		name = depmod_path;
+	const char *name_end = depmod_path + depmod_path_len;
+	size_t ko_len = depmod_path_len;
+	for (int j = 0; j < 2; j++) {
+		char *dot = memrchr(name, '.', name_end - name);
+		if (!dot)
+			break;
+		if (name_end - dot == 3
+		    && dot[1] == 'k' && dot[2] == 'o') {
+			ko_len = name_end - depmod_path;
+			break;
+		}
+		name_end = dot;
 	}
 
-	err = cache_kernel_module_sections(kmod_it, elf);
-	if (err) {
-		err = drgn_debug_info_report_error(load, path,
-						   "could not get section addresses",
-						   err);
-		elf_end(elf);
-		close(fd);
-		free(path);
+	STRING_BUILDER(sb);
+	for (size_t i = 0; options->kernel_directories[i]; i++) {
+		const char *kernel_dir = options->kernel_directories[i];
+
+		if (kernel_dir[0]) {
+			sb.len = 0;
+			if (!string_builder_append(&sb, kernel_dir))
+				return &drgn_enomem;
+		} else {
+			// Empty path. Try under the debug directories first.
+			err = drgn_module_try_depmod_in_debug_directories(module,
+									  options,
+									  &sb,
+									  depmod_path,
+									  ko_len);
+			if (err || !drgn_module_wants_file(module))
+				return err;
+
+			// Try /lib/modules/$osrelease as the kernel directory.
+			sb.len = 0;
+			if (!string_builder_append(&sb, "/lib/modules/")
+			    || !string_builder_append(&sb,
+						      prog->vmcoreinfo.osrelease))
+				return &drgn_enomem;
+		}
+		if (!string_builder_appendc(&sb, '/')
+		    || !string_builder_appendn(&sb, depmod_path, depmod_path_len)
+		    || !string_builder_null_terminate(&sb))
+			return &drgn_enomem;
+		err = drgn_module_try_standard_file(module, options, sb.str, -1,
+						    true, NULL);
+		if (err || !drgn_module_wants_file(module))
+			return err;
+	}
+	return NULL;
+}
+
+static struct drgn_error *
+drgn_kmod_walk_next_dir(struct drgn_program *prog,
+			const struct drgn_debug_info_options *options,
+			struct drgn_kmod_walk_state *state)
+{
+	struct string_builder *path = &state->path;
+	for (;;) {
+		if (state->next_debug_dir) {
+			const char *debug_dir = *state->next_debug_dir++;
+			if (debug_dir && debug_dir[0] != '/')
+				continue;
+
+			path->len = 0;
+			if (debug_dir) {
+				if (!string_builder_append(path, debug_dir))
+					return &drgn_enomem;
+			} else {
+				state->next_debug_dir = NULL;
+			}
+			if (!string_builder_append(path, "/lib/modules/")
+			    || !string_builder_append(path,
+						      prog->vmcoreinfo.osrelease))
+				return &drgn_enomem;
+		} else {
+			const char *kernel_dir = *state->next_kernel_dir;
+			if (!kernel_dir)
+				return &drgn_stop;
+			state->next_kernel_dir++;
+			if (kernel_dir[0]) {
+				path->len = 0;
+				if (!string_builder_append(path, kernel_dir))
+					return &drgn_enomem;
+			} else {
+				state->next_debug_dir = options->directories;
+				continue;
+			}
+		}
+
+		if (!string_builder_null_terminate(path))
+			return &drgn_enomem;
+		struct drgn_kmod_walk_stack_entry entry = {
+			.dir = opendir(path->str),
+			.path_len = path->len,
+		};
+		if (!entry.dir) {
+			drgn_log_debug(prog, "opendir: %s: %m", path->str);
+			continue;
+		}
+		if (!drgn_kmod_walk_stack_append(&state->stack, &entry)) {
+			closedir(entry.dir);
+			return &drgn_enomem;
+		}
+		drgn_log_debug(prog, "searching for kernel modules in %s",
+			       path->str);
+		return NULL;
+	}
+}
+
+static struct drgn_error *
+drgn_kmod_walk(struct drgn_program *prog,
+	       const struct drgn_debug_info_options *options,
+	       struct drgn_kmod_walk_state *state,
+	       struct drgn_kmod_walk_module_map_entry *current)
+{
+	struct drgn_error *err;
+	struct string_builder *path = &state->path;
+
+	for (;;) {
+		if (drgn_kmod_walk_stack_empty(&state->stack)) {
+			err = drgn_kmod_walk_next_dir(prog, options, state);
+			if (err)
+				return err;
+		}
+
+		struct drgn_kmod_walk_stack_entry *top =
+			drgn_kmod_walk_stack_last(&state->stack);
+		errno = 0;
+		struct dirent *ent = readdir(top->dir);
+		if (!ent) {
+			if (errno) {
+				path->str[top->path_len] = '\0';
+				drgn_log_debug(prog, "%s: readdir: %m",
+					       path->str);
+			}
+			closedir(top->dir);
+			drgn_kmod_walk_stack_pop(&state->stack);
+			continue;
+		}
+
+		// Skip "." and "..".
+		if (ent->d_name[0] == '.'
+		    && (!ent->d_name[1]
+			|| (ent->d_name[1] == '.' && !ent->d_name[2])))
+			continue;
+
+		bool is_directory = false;
+		if (ent->d_type == DT_LNK || ent->d_type == DT_UNKNOWN) {
+			struct stat st;
+			if (fstatat(dirfd(top->dir), ent->d_name, &st, 0) < 0) {
+				path->str[top->path_len] = '\0';
+				drgn_log_debug(prog, "%s/%s: fstatat: %m",
+					       path->str, ent->d_name);
+				continue;
+			}
+			if (S_ISDIR(st.st_mode))
+				is_directory = true;
+			else if (!S_ISREG(st.st_mode))
+				continue;
+		} else if (ent->d_type == DT_DIR) {
+			is_directory = true;
+		} else if (ent->d_type != DT_REG) {
+			continue;
+		}
+
+		if (is_directory) {
+			path->len = top->path_len;
+			if (!string_builder_appendc(path, '/')
+			    || !string_builder_append(path, ent->d_name)
+			    || !string_builder_null_terminate(path))
+				return &drgn_enomem;
+
+			_cleanup_close_ int fd =
+				openat(dirfd(top->dir), ent->d_name,
+				       O_RDONLY | O_DIRECTORY);
+			if (fd < 0) {
+				drgn_log_debug(prog, "openat: %s: %m",
+					       path->str);
+				continue;
+			}
+
+			struct stat st;
+			if (fstat(fd, &st) < 0) {
+				drgn_log_debug(prog, "fstat: %s: %m",
+					       path->str);
+				continue;
+			}
+			struct drgn_kmod_walk_inode inode = {
+				.dev = st.st_dev,
+				.ino = st.st_ino,
+			};
+			int r = drgn_kmod_walk_inode_set_insert(&state->visited_dirs,
+								&inode, NULL);
+			if (r < 0)
+				return &drgn_enomem;
+			if (r == 0) {
+				drgn_log_debug(prog,
+					       "%s is cycle or duplicate; skipping",
+					       path->str);
+				continue;
+			}
+
+			struct drgn_kmod_walk_stack_entry entry = {
+				.dir = fdopendir(fd),
+				.path_len = path->len,
+			};
+			if (!entry.dir) {
+				drgn_log_debug(prog, "fdopendir: %s: %m",
+					       path->str);
+				continue;
+			}
+			fd = -1; // entry.dir owns fd now.
+			if (!drgn_kmod_walk_stack_append(&state->stack,
+							 &entry)) {
+				closedir(entry.dir);
+				return &drgn_enomem;
+			}
+		} else {
+			// Match anything where the first extension is ".ko".
+			char *dot = strchr(ent->d_name, '.');
+			if (!dot || dot[1] != 'k' || dot[2] != 'o'
+			    || (dot[3] != '\0' && dot[3] != '.'))
+				continue;
+
+			// Borrow the path string builder to build the module
+			// name (removing extensions and replacing '-' with
+			// '_').
+			path->len = top->path_len;
+			if (!string_builder_appendn(path, ent->d_name,
+						    dot - ent->d_name)
+			    || !string_builder_null_terminate(path))
+				return &drgn_enomem;
+			char *dash = &path->str[top->path_len];
+			while ((dash = strchr(dash, '-')))
+				*dash++ = '_';
+
+			// Find the module (if wanted).
+			const char *module_name = &path->str[top->path_len];
+			auto it = drgn_kmod_walk_module_map_search(&state->modules,
+								   &module_name);
+			if (!it.entry)
+				continue;
+
+			size_t name_len = strlen(ent->d_name);
+			size_t path_len;
+			if (__builtin_add_overflow(top->path_len, name_len,
+						   &path_len)
+			    || __builtin_add_overflow(path_len, 2, &path_len))
+				return &drgn_enomem;
+			_cleanup_free_ char *file_path = malloc(path_len);
+			if (!file_path)
+				return &drgn_enomem;
+			memcpy(file_path, path->str, top->path_len);
+			file_path[top->path_len] = '/';
+			memcpy(&file_path[top->path_len + 1], ent->d_name,
+			       name_len + 1);
+			drgn_log_debug(prog, "found kernel module %s", file_path);
+
+			if (!char_p_vector_append(&it.entry->value, &file_path))
+				return &drgn_enomem;
+			file_path = NULL; // it.entry->value owns file_path now.
+
+			// If the file matches the current module, return it.
+			// Otherwise, keep going.
+			if (it.entry == current)
+				return NULL;
+		}
+	}
+}
+
+struct drgn_error *
+drgn_module_try_linux_kmod_files(struct drgn_module *module,
+				 const struct drgn_debug_info_options *options,
+				 struct drgn_standard_debug_info_find_state *state)
+{
+	struct drgn_error *err;
+
+	if (options->try_kmod == DRGN_KMOD_SEARCH_NONE)
+		return NULL;
+
+	if (options->try_kmod != DRGN_KMOD_SEARCH_WALK) {
+		err = drgn_open_modules_dep(module->prog, options,
+					    &state->modules_dep);
+		if (err)
+			return err;
+		if (state->modules_dep.len > 0) {
+			err = drgn_module_try_linux_kmod_depmod(module, options,
+								state);
+			if (err
+			    || options->try_kmod != DRGN_KMOD_SEARCH_DEPMOD_AND_WALK
+			    || !drgn_module_wants_file(module))
+				return err;
+		}
+		if (options->try_kmod == DRGN_KMOD_SEARCH_DEPMOD)
+			return NULL;
+	}
+
+	if (drgn_kmod_walk_module_map_empty(&state->kmod_walk.modules)) {
+		for (size_t i = 0; i < state->num_modules; i++) {
+			if (!drgn_module_wants_file(state->modules[i]))
+				continue;
+			struct drgn_kmod_walk_module_map_entry entry = {
+				.key = state->modules[i]->name,
+				.value = VECTOR_INIT,
+			};
+			if (drgn_kmod_walk_module_map_insert(&state->kmod_walk.modules,
+							     &entry, NULL) < 0)
+				return &drgn_enomem;
+		}
+	}
+
+	const char *module_name = module->name;
+	auto it = drgn_kmod_walk_module_map_search(&state->kmod_walk.modules,
+						   &module_name);
+	size_t i = 0;
+	for (;;) {
+		if (i >= char_p_vector_size(&it.entry->value)) {
+			// No matches remaining for this module. Clear the old
+			// matches and find another one.
+			vector_for_each(char_p_vector, path, &it.entry->value)
+				free(*path);
+			char_p_vector_clear(&it.entry->value);
+			i = 0;
+
+			err = drgn_kmod_walk(module->prog, options,
+					     &state->kmod_walk, it.entry);
+			if (err == &drgn_stop)
+				break;
+			else if (err)
+				return err;
+		}
+		char *path = *char_p_vector_at(&it.entry->value, i++);
+		err = drgn_module_try_standard_file(module, options, path, -1,
+						    true, NULL);
+		if (err)
+			return err;
+		if (!drgn_module_wants_file(module))
+			break;
+	}
+	// We won't need any more matches for this module.
+	drgn_kmod_walk_module_map_entry_deinit(it.entry);
+	drgn_kmod_walk_module_map_delete_iterator(&state->kmod_walk.modules,
+						  it);
+	return NULL;
+}
+
+// This has a weird calling convention so that the caller can call
+// drgn_error_format_os() itself.
+static const char *get_gnu_build_id_from_note_file(int fd,
+						   void **bufp,
+						   size_t *buf_capacityp,
+						   const void **build_id_ret,
+						   size_t *build_id_len_ret)
+{
+	struct stat st;
+	if (fstat(fd, &st) < 0)
+		return "fstat";
+
+	if (st.st_size > SSIZE_MAX
+	    || !alloc_or_reuse(bufp, buf_capacityp, st.st_size))
+		return "";
+
+	ssize_t r = read_all(fd, *bufp, st.st_size);
+	if (r < 0)
+		return "read";
+	*build_id_len_ret = parse_gnu_build_id_from_notes(*bufp, r, 4, false,
+							  build_id_ret);
+	return NULL;
+}
+
+static struct drgn_error *
+get_build_id_from_sys_kernel_notes(void **buf_ret,
+				   const void **build_id_ret,
+				   size_t *build_id_len_ret)
+{
+	static const char path[] = "/sys/kernel/notes";
+	_cleanup_close_ int fd = open(path, O_RDONLY);
+	if (fd == -1)
+		return drgn_error_create_os("open", errno, path);
+
+	_cleanup_free_ void *buf = NULL;
+	size_t buf_capacity = 0;
+	const char *message = get_gnu_build_id_from_note_file(fd, &buf,
+							      &buf_capacity,
+							      build_id_ret,
+							      build_id_len_ret);
+	if (message && message[0])
+		return drgn_error_create_os(message, errno, path);
+	else if (message)
+		return &drgn_enomem;
+	*buf_ret = no_cleanup_ptr(buf);
+	return NULL;
+}
+
+// Arbitrary limit on the number iterations to make through the modules list in
+// order to avoid getting stuck in a cycle.
+static const int MAX_MODULE_LIST_ITERATIONS = 10000;
+
+struct linux_kernel_loaded_module_iterator {
+	struct drgn_module_iterator it;
+	bool yielded_vmlinux;
+	int module_list_iterations_remaining;
+	// `struct module` type.
+	struct drgn_qualified_type module_type;
+	// `struct list_head *` in next module to yield.
+	struct drgn_object node;
+	// Address of `struct list_head modules`.
+	uint64_t modules_head;
+};
+
+static void
+linux_kernel_loaded_module_iterator_destroy(struct drgn_module_iterator *_it)
+{
+	struct linux_kernel_loaded_module_iterator *it =
+		container_of(_it, struct linux_kernel_loaded_module_iterator, it);
+	drgn_object_deinit(&it->node);
+	free(it);
+}
+
+static struct drgn_error *
+yield_vmlinux(struct linux_kernel_loaded_module_iterator *it,
+	      struct drgn_module **ret, bool *new_ret)
+{
+	struct drgn_error *err;
+	struct drgn_program *prog = it->it.prog;
+
+	_cleanup_(drgn_module_deletep) struct drgn_module *module = NULL;
+	bool new;
+	err = drgn_module_find_or_create_main(prog, "kernel", &module, &new);
+	if (err)
+		return err;
+	if (!new) {
+		*ret = no_cleanup_ptr(module);
+		if (new_ret)
+			*new_ret = new;
+		return NULL;
+	}
+
+	if (prog->vmcoreinfo.build_id_len > 0) {
+		// Since Linux kernel commit 0935288c6e00 ("kdump: append kernel
+		// build-id string to VMCOREINFO") (in v5.9), we can get the
+		// build ID from VMCOREINFO.
+		err = drgn_module_set_build_id(module, prog->vmcoreinfo.build_id,
+					       prog->vmcoreinfo.build_id_len);
+		if (err)
+			return err;
+		drgn_log_debug(prog,
+			       "found kernel build ID %s in VMCOREINFO",
+			       module->build_id_str);
+	} else if (prog->flags & DRGN_PROGRAM_IS_LIVE) {
+		// Before that, on the live kernel, we can get the build ID from
+		// /sys/kernel/notes.
+		_cleanup_free_ void *build_id_buf = NULL;
+		const void *build_id;
+		size_t build_id_len;
+		err = get_build_id_from_sys_kernel_notes(&build_id_buf,
+							 &build_id,
+							 &build_id_len);
+		if (err)
+			return err;
+		if (build_id_len > 0) {
+			err = drgn_module_set_build_id(module, build_id,
+						       build_id_len);
+			if (err)
+				return err;
+			drgn_log_debug(prog,
+				       "found kernel build ID %s in /sys/kernel/notes",
+				       module->build_id_str);
+		} else {
+			drgn_log_debug(prog,
+				       "couldn't find kernel build ID in /sys/kernel/notes");
+		}
+	} else {
+		// Otherwise, we can't get the build ID.
+		drgn_log_debug(prog, "couldn't find kernel build ID");
+	}
+	*ret = no_cleanup_ptr(module);
+	if (new_ret)
+		*new_ret = new;
+	return NULL;
+}
+
+static struct drgn_error *
+kernel_module_set_build_id_live(struct drgn_module *module)
+{
+	struct drgn_error *err;
+	struct drgn_program *prog = module->prog;
+
+	_cleanup_free_ char *path;
+	if (asprintf(&path, "/sys/module/%s/notes", module->name) < 0) {
+		path = NULL;
+		return &drgn_enomem;
+	}
+	_cleanup_closedir_ DIR *dir = opendir(path);
+	if (!dir) {
+		if (errno == ENOENT) {
+			drgn_log_debug(prog, "opendir: %s: %m", path);
+			return NULL;
+		} else {
+			return drgn_error_create_os("opendir", errno, path);
+		}
+	}
+
+	_cleanup_free_ void *buf = NULL;
+	size_t capacity = 0;
+
+	struct dirent *ent;
+	while ((errno = 0, ent = readdir(dir))) {
+		if (ent->d_type == DT_DIR)
+			continue;
+
+		_cleanup_close_ int fd = openat(dirfd(dir), ent->d_name,
+						O_RDONLY);
+		if (fd < 0) {
+			return drgn_error_format_os("openat", errno, "%s/%s",
+						    path, ent->d_name);
+		}
+
+		const void *build_id;
+		size_t build_id_len;
+		const char *message =
+			get_gnu_build_id_from_note_file(fd, &buf, &capacity,
+							&build_id,
+							&build_id_len);
+		if (message && message[0]) {
+			return drgn_error_format_os(message, errno, "%s/%s",
+						    path, ent->d_name);
+		} else if (message) {
+			return &drgn_enomem;
+		}
+		if (build_id_len > 0) {
+			err = drgn_module_set_build_id(module, build_id,
+						       build_id_len);
+			if (!err) {
+				drgn_log_debug(prog,
+					       "found build ID %s in %s/%s",
+					       module->build_id_str, path,
+					       ent->d_name);
+			}
+			return err;
+		}
+	}
+	if (errno)
+		return drgn_error_create_os("readdir", errno, path);
+	drgn_log_debug(prog, "couldn't find build ID in %s", path);
+	return NULL;
+}
+
+static struct drgn_error *
+kernel_module_set_build_id(struct drgn_module *module,
+			   const struct drgn_object *module_obj,
+			   bool use_sys_module)
+{
+	if (use_sys_module)
+		return kernel_module_set_build_id_live(module);
+
+	struct drgn_error *err;
+	struct drgn_program *prog = module->prog;
+	const bool bswap = drgn_platform_bswap(&prog->platform);
+
+	DRGN_OBJECT(attrs, prog);
+	DRGN_OBJECT(attr, prog);
+	DRGN_OBJECT(tmp, prog);
+	_cleanup_free_ void *buf = NULL;
+	size_t capacity = 0;
+
+	err = drgn_object_member(&attrs, module_obj, "notes_attrs");
+	if (err)
+		return err;
+
+	bool group = true;
+	uint64_t n;
+	err = drgn_object_member_dereference(&attrs, &attrs, "grp");
+	if (!err) {
+		// Since Linux kernel commit 4723f16de64e ("module: sysfs: Add
+		// notes attributes through attribute_group") (in v6.14), we
+		// have to iterate over struct attribute_group::bin_attrs, a
+		// null-terminated array of struct bin_attribute pointers.
+
+		// attr = mod->notes_attrs->grp.bin_attrs
+		err = drgn_object_member(&attrs, &attrs, "bin_attrs");
+		if (err)
+			return err;
+	} else if (drgn_error_catch(&err, DRGN_ERROR_LOOKUP)) {
+		// Before that, there was no struct attribute_group for notes,
+		// so we iterate over struct module_notes_attrs::attrs, an array
+		// of struct bin_attribute with a length given by struct
+		// module_notes_attrs::notes.
+		group = false;
+		// n = mod->notes_attrs->notes
+		err = drgn_object_member_dereference(&tmp, &attrs, "notes");
+		if (err)
+			return err;
+		err = drgn_object_read_unsigned(&tmp, &n);
+		if (err)
+			return err;
+
+		// attrs = mod->notes_attrs->attrs
+		err = drgn_object_member_dereference(&attrs, &attrs, "attrs");
+		if (err)
+			return err;
+	} else {
 		return err;
 	}
 
-	err = drgn_debug_info_report_elf(load, path, fd, elf, kmod_it->start,
-					 kmod_it->end, kmod_it->name, NULL);
-	free(path);
-	return err;
-}
+	// If we're not using struct attribute_group, we know how many
+	// attributes there are.
+	for (uint64_t i = 0; group || i < n; i++) {
+		// attr = attrs[i]
+		err = drgn_object_subscript(&attr, &attrs, i);
+		if (err)
+			return err;
 
-static struct drgn_error *
-report_loaded_kernel_modules(struct drgn_debug_info_load_state *load,
-			     struct kernel_module_table *kmod_table,
-			     struct depmod_index *depmod, bool use_sys_module)
-{
-	struct drgn_program *prog = load->dbinfo->prog;
-	struct drgn_error *err;
-
-	struct kernel_module_iterator kmod_it;
-	err = kernel_module_iterator_init(&kmod_it, prog, use_sys_module);
-	if (err) {
-kernel_module_iterator_error:
-		return drgn_debug_info_report_error(load, "kernel modules",
-						    "could not find loaded kernel modules",
-						    err);
-	}
-	for (;;) {
-		err = kernel_module_iterator_next(&kmod_it);
-		if (err == &drgn_stop) {
-			err = NULL;
-			break;
-		} else if (err) {
-			kernel_module_iterator_deinit(&kmod_it);
-			goto kernel_module_iterator_error;
-		}
-
-		/* Look for an explicitly-reported file first. */
-		if (kmod_table) {
-			err = report_loaded_kernel_module(load, &kmod_it,
-							  kmod_table);
-			if (!err)
-				continue;
-			else if (err != &drgn_not_found)
-				break;
-		}
-
-		/*
-		 * If it was not reported explicitly and we're also reporting the
-		 * defaults, look for the module at the standard locations unless we've
-		 * already indexed that module.
-		 */
-		if (depmod &&
-		    !drgn_debug_info_is_indexed(load->dbinfo, kmod_it.name)) {
-			if (!depmod->addr) {
-				err = depmod_index_init(depmod,
-							prog->vmcoreinfo.osrelease);
-				if (err) {
-					depmod->addr = NULL;
-					err = drgn_debug_info_report_error(load,
-									   "kernel modules",
-									   "could not read depmod",
-									   err);
-					if (err)
-						break;
-					depmod = NULL;
-					continue;
-				}
-			}
-			err = report_default_kernel_module(load, &kmod_it,
-							   depmod);
+		if (group) {
+			// If we're using struct attribute_group, we stop when
+			// we hit a NULL pointer.
+			err = drgn_object_read(&attr, &attr);
 			if (err)
+				return err;
+			bool truthy;
+			err = drgn_object_bool(&attr, &truthy);
+			if (err)
+				return err;
+			if (!truthy)
 				break;
+		} else {
+			// attr = &attrs[i]
+			err = drgn_object_address_of(&attr, &attr);
+			if (err)
+				return err;
+		}
+
+		// address = attr->private
+		err = drgn_object_member_dereference(&tmp, &attr, "private");
+		if (err)
+			return err;
+		uint64_t address;
+		err = drgn_object_read_unsigned(&tmp, &address);
+		if (err)
+			return err;
+
+		// size = attr->size
+		err = drgn_object_member_dereference(&tmp, &attr, "size");
+		if (err)
+			return err;
+		uint64_t size;
+		err = drgn_object_read_unsigned(&tmp, &size);
+		if (err)
+			return err;
+
+		if (size > SIZE_MAX || !alloc_or_reuse(&buf, &capacity, size))
+			return &drgn_enomem;
+
+		err = drgn_program_read_memory(prog, buf, address, size, false);
+		if (err)
+			return err;
+
+		const void *build_id;
+		size_t build_id_len =
+			parse_gnu_build_id_from_notes(buf, size, 4, bswap,
+						      &build_id);
+		if (build_id_len > 0) {
+			err = drgn_module_set_build_id(module, build_id,
+						       build_id_len);
+			if (!err) {
+				drgn_log_debug(prog,
+					       "found build ID %s in notes_attrs",
+					       module->build_id_str);
+			}
+			return err;
 		}
 	}
-	kernel_module_iterator_deinit(&kmod_it);
-	return err;
+	drgn_log_debug(prog,
+		       "couldn't find build ID in notes_attrs");
+	return NULL;
 }
 
 static struct drgn_error *
-report_kernel_modules(struct drgn_debug_info_load_state *load,
-		      struct kernel_module_file *kmods, size_t num_kmods,
-		      bool vmlinux_is_pending)
+kernel_module_set_section_addresses_live(struct drgn_module *module)
 {
-	struct drgn_program *prog = load->dbinfo->prog;
 	struct drgn_error *err;
+	struct drgn_program *prog = module->prog;
 
-	if (!num_kmods && !load->load_default)
+	_cleanup_free_ char *path;
+	if (asprintf(&path, "/sys/module/%s/sections", module->name) < 0) {
+		path = NULL;
+		return &drgn_enomem;
+	}
+	_cleanup_closedir_ DIR *dir = opendir(path);
+	if (!dir)
+		return drgn_error_create_os("opendir", errno, path);
+
+	struct dirent *ent;
+	while ((errno = 0, ent = readdir(dir))) {
+		if (ent->d_type == DT_DIR)
+			continue;
+
+		_cleanup_close_ int fd = openat(dirfd(dir), ent->d_name,
+						O_RDONLY);
+		if (fd < 0) {
+			return drgn_error_format_os("openat", errno, "%s/%s",
+						    path, ent->d_name);
+		}
+
+		_cleanup_fclose_ FILE *file = fdopen(fd, "r");
+		if (!file)
+			return drgn_error_create_os("fdopen", errno, NULL);
+		uint64_t address;
+		if (fscanf(file, "%" SCNx64, &address) != 1) {
+			return drgn_error_format(DRGN_ERROR_OTHER,
+						 "could not parse %s/%s",
+						 path, ent->d_name);
+		}
+
+		drgn_log_debug(prog, "found section %s@0x%" PRIx64 " in %s",
+			       ent->d_name, address, path);
+		err = drgn_module_set_section_address(module, ent->d_name,
+						      address);
+		if (err)
+			return err;
+	}
+	if (errno)
+		return drgn_error_create_os("readdir", errno, path);
+	return NULL;
+}
+
+static struct drgn_error *
+kernel_module_set_section_addresses(struct drgn_module *module,
+				    const struct drgn_object *module_obj,
+				    bool use_sys_module)
+{
+	struct drgn_error *err;
+	struct drgn_program *prog = module->prog;
+
+	DRGN_OBJECT(tmp, prog);
+
+	// As of Linux 6.0, the .data..percpu section is not included in the
+	// section attributes. (kernel/module/sysfs.c:add_sect_attrs() only
+	// creates attributes for sections with the SHF_ALLOC flag set, but
+	// kernel/module/main.c:layout_and_allocate() clears the SHF_ALLOC flag
+	// for the .data..percpu section.) However, we need this address so that
+	// global per-CPU variables will be relocated correctly. Get it from
+	// `struct module`.
+	err = drgn_object_member(&tmp, module_obj, "percpu");
+	if (!err) {
+		uint64_t address;
+		err = drgn_object_read_unsigned(&tmp, &address);
+		if (err)
+			return err;
+		drgn_log_debug(prog, "module percpu is 0x%" PRIx64, address);
+		// struct module::percpu is NULL if the module doesn't have any
+		// per-CPU data.
+		if (address) {
+			err = drgn_module_set_section_address(module,
+							      ".data..percpu",
+							      address);
+			if (err)
+				return err;
+		}
+	} else if (err->code == DRGN_ERROR_LOOKUP) {
+		// struct module::percpu doesn't exist if !SMP.
+		drgn_error_destroy(err);
+	} else {
+		return err;
+	}
+
+	if (use_sys_module) {
+		err = kernel_module_set_section_addresses_live(module);
+		// We could be debugging /proc/kcore without root privileges via
+		// an fd that we were passed. If we didn't have permission to
+		// access the files in /sys/module/$module/sections, fall back
+		// to the non-live path.
+		if (!err || err->code != DRGN_ERROR_OS || err->errnum != EACCES)
+			return err;
+		drgn_error_log_debug(prog, err, "falling back to sect_attrs: ");
+		drgn_error_destroy(err);
+	}
+
+	DRGN_OBJECT(attrs, prog);
+	DRGN_OBJECT(attr, prog);
+
+	err = drgn_object_member(&attrs, module_obj, "sect_attrs");
+	if (err)
+		return err;
+
+	bool group = true;
+	uint64_t nsections;
+	err = drgn_object_member_dereference(&tmp, &attrs, "nsections");
+	if (drgn_error_catch(&err, DRGN_ERROR_LOOKUP)) {
+		// Since Linux kernel commit d8959b947a8d ("module: sysfs: Drop
+		// member 'module_sect_attrs::nsections'") (in v6.14), we have
+		// to iterate over struct attribute_group::bin_attrs, a
+		// null-terminated array of struct bin_attribute pointers.
+
+		// attrs = mod->sect_attrs->grp.bin_attrs
+		err = drgn_object_member_dereference(&attrs, &attrs, "grp");
+		if (err)
+			return err;
+		err = drgn_object_member(&attrs, &attrs, "bin_attrs");
+		if (err)
+			return err;
+	} else if (!err) {
+		// Before that, struct module_sect_attrs::grp still exists.
+		// However, since Linux kernel commit ed66f991bb19 ("module:
+		// Refactor section attr into bin attribute") (in v5.8), the
+		// sections are in struct attribute_group::bin_attrs, and before
+		// that, they're in struct attribute_group::attrs. Additionally,
+		// we'd then have to get the containing struct module_sect_attr
+		// to get the section address.
+		//
+		// Instead, it's easier to iterate over struct
+		// module_sect_attrs::attrs, an array of struct module_sect_attr
+		// with a length given by struct module_sect_attrs::nsections.
+		group = false;
+		// nsections = mod->sect_attrs->nsections
+		err = drgn_object_read_unsigned(&tmp, &nsections);
+		if (err)
+			return err;
+
+		// attrs = mod->sect_attrs->attrs
+		err = drgn_object_member_dereference(&attrs, &attrs, "attrs");
+		if (err)
+			return err;
+	} else {
+		return err;
+	}
+
+	// If we're not using struct attribute_group, we know how many
+	// attributes there are.
+	for (uint64_t i = 0; group || i < nsections; i++) {
+		// attr = attrs[i]
+		err = drgn_object_subscript(&attr, &attrs, i);
+		if (err)
+			return err;
+
+		if (group) {
+			// If we're using struct attribute_group, we stop when
+			// we hit a NULL pointer.
+			err = drgn_object_read(&attr, &attr);
+			if (err)
+				return err;
+			bool truthy;
+			err = drgn_object_bool(&attr, &truthy);
+			if (err)
+				return err;
+			if (!truthy)
+				break;
+			// Since Linux kernel commit 4b2c11e4aaf7 ("module:
+			// sysfs: Drop member 'module_sect_attr::address'") (in
+			// v6.14), the section address is in struct
+			// bin_attribute::private.
+			err = drgn_object_member_dereference(&tmp, &attr,
+							     "private");
+		} else {
+			// Before that, the section address is in struct
+			// module_sect_attr::address.
+			err = drgn_object_member(&tmp, &attr, "address");
+			if (err)
+				return err;
+		}
+		uint64_t address;
+		err = drgn_object_read_unsigned(&tmp, &address);
+		if (err)
+			return err;
+
+		if (group) {
+			// attr = attr->attr
+			err = drgn_object_member_dereference(&attr, &attr,
+							     "attr");
+			if (err)
+				return err;
+		} else {
+			// Since Linux kernel commit ed66f991bb19 ("module:
+			// Refactor section attr into bin attribute") (in v5.8),
+			// the section name is module_sect_attr.battr.attr.name.
+			// Before that, it is simply module_sect_attr.name.
+
+			// attr = attr.battr.attr
+			err = drgn_object_member(&attr, &attr, "battr");
+			if (!err) {
+				err = drgn_object_member(&attr, &attr, "attr");
+				if (err)
+					return err;
+			} else if (!drgn_error_catch(&err, DRGN_ERROR_LOOKUP)) {
+				return err;
+			}
+		}
+		err = drgn_object_member(&tmp, &attr, "name");
+		if (err)
+			return err;
+		_cleanup_free_ char *name = NULL;
+		err = drgn_object_read_c_string(&tmp, &name);
+		if (err)
+			return err;
+
+		drgn_log_debug(prog,
+			       "found section %s@0x%" PRIx64 " in sect_attrs",
+			       name, address);
+		err = drgn_module_set_section_address(module, name, address);
+		if (err)
+			return err;
+	}
+	return NULL;
+}
+
+static struct drgn_error *
+kernel_module_find_or_create_internal(const struct drgn_object *module_obj,
+				      struct drgn_module **ret, bool *new_ret,
+				      bool create, bool log)
+{
+	struct drgn_error *err;
+	struct drgn_program *prog = drgn_object_program(module_obj);
+
+	struct drgn_module_key key;
+	key.kind = DRGN_MODULE_RELOCATABLE;
+	uint64_t name_offset;
+	err = drgn_type_offsetof(module_obj->type, "name", &name_offset);
+	if (err)
+		return err;
+	if (name_offset >= drgn_object_size(module_obj)
+	    || !memchr(drgn_object_buffer(module_obj) + name_offset, '\0',
+		       drgn_object_size(module_obj) - name_offset)) {
+		return drgn_error_create(DRGN_ERROR_OTHER,
+					 "couldn't read module name");
+	}
+	key.relocatable.name = drgn_object_buffer(module_obj) + name_offset;
+
+	DRGN_OBJECT(mem, prog);
+	DRGN_OBJECT(val, prog);
+	bool layout_in_module = false;
+	err = drgn_object_member(&mem, module_obj, "mem");
+	if (!err) {
+		// Since Linux kernel commit ac3b43283923 ("module: replace
+		// module_layout with module_memory") (in v6.4), the base and
+		// size are in the `struct module_memory mem[MOD_TEXT]` member
+		// of `struct module`.
+		if (!prog->mod_text_cached) {
+			err = drgn_program_find_object(prog, "MOD_TEXT", NULL,
+						       DRGN_FIND_OBJECT_CONSTANT,
+						       &val);
+			if (err)
+				return err;
+			union drgn_value mod_text_value;
+			err = drgn_object_read_integer(&val, &mod_text_value);
+			if (err)
+				return err;
+			prog->mod_text = mod_text_value.uvalue;
+			prog->mod_text_cached = true;
+		}
+		err = drgn_object_subscript(&mem, &mem, prog->mod_text);
+		if (err)
+			return err;
+	} else {
+		if (err->code != DRGN_ERROR_LOOKUP)
+			return err;
+		drgn_error_destroy(err);
+		// Between that and Linux kernel commit 7523e4dc5057 ("module:
+		// use a structure to encapsulate layout.") (in v4.5), the base
+		// and size are in the `struct module_layout core_layout` member
+		// of `struct module`.
+		err = drgn_object_member(&mem, module_obj, "core_layout");
+		if (err) {
+			if (err->code != DRGN_ERROR_LOOKUP)
+				return err;
+			drgn_error_destroy(err);
+			// Before that, they are directly in the `struct
+			// module`.
+			layout_in_module = true;
+		}
+	}
+	if (layout_in_module)
+		err = drgn_object_member(&val, module_obj, "module_core");
+	else
+		err = drgn_object_member(&val, &mem, "base");
+	if (err)
+		return err;
+	err = drgn_object_read_unsigned(&val, &key.relocatable.address);
+	if (err)
+		return err;
+
+	if (log) {
+		drgn_log_debug(prog, "found loaded kernel module %s@0x%" PRIx64,
+			       key.relocatable.name, key.relocatable.address);
+	}
+
+	if (!create) {
+		*ret = drgn_module_find(prog, &key);
+		if (new_ret)
+			*new_ret = false;
 		return NULL;
+	}
 
-	/*
-	 * If we're debugging the running kernel, we can use
-	 * /sys/module/$module/notes and /sys/module/$module/sections instead of
-	 * getting the equivalent information from the core dump. This fast path
-	 * can be disabled via an environment variable for testing. It may also
-	 * be disabled if we encounter permission issues using
-	 * /sys/module/$module/sections.
-	 */
+	_cleanup_(drgn_module_deletep) struct drgn_module *module = NULL;
+	bool new;
+	err = drgn_module_find_or_create(prog, &key, key.relocatable.name,
+					 &module, &new);
+	if (err)
+		return err;
+	if (!new) {
+		*ret = no_cleanup_ptr(module);
+		if (new_ret)
+			*new_ret = new;
+		return NULL;
+	}
+
+	if (layout_in_module)
+		err = drgn_object_member(&val, module_obj, "core_size");
+	else
+		err = drgn_object_member(&val, &mem, "size");
+	if (err)
+		return err;
+	uint64_t size;
+	err = drgn_object_read_unsigned(&val, &size);
+	if (err)
+		return err;
+
+	drgn_log_debug(prog, "module size is %" PRIu64, size);
+	err = drgn_module_set_address_range(module, key.relocatable.address,
+					    key.relocatable.address + size);
+	if (err)
+		return err;
+
+	// If we're debugging the running kernel, we can use
+	// /sys/module/$module/notes and /sys/module/$module/sections instead of
+	// getting the equivalent information from the core dump. This fast path
+	// can be disabled via an environment variable for testing. It may also
+	// be disabled if we encounter permission issues using
+	// /sys/module/$module/sections.
 	bool use_sys_module = false;
 	if (prog->flags & DRGN_PROGRAM_IS_LOCAL) {
 		char *env = getenv("DRGN_USE_SYS_MODULE");
 		use_sys_module = !env || atoi(env);
 	}
-	/*
-	 * We need to index vmlinux now so that we can walk the list of modules
-	 * in the kernel.
-	 */
-	if (vmlinux_is_pending) {
-		err = drgn_debug_info_report_flush(load);
-		if (err)
-			return err;
-	}
-
-	struct kernel_module_table kmod_table = HASH_TABLE_INIT;
-	struct depmod_index depmod;
-	depmod.addr = NULL;
-	struct kernel_module_table_iterator it;
-	for (size_t i = 0; i < num_kmods; i++) {
-		struct kernel_module_file *kmod = &kmods[i];
-
-		ssize_t build_id_len =
-			dwelf_elf_gnu_build_id(kmod->elf, &kmod->gnu_build_id);
-		if (build_id_len < 0) {
-			err = drgn_debug_info_report_error(load, kmod->path,
-							   NULL,
-							   drgn_error_libelf());
-			if (err)
-				goto out;
-			continue;
-		}
-		kmod->gnu_build_id_len = build_id_len;
-
-		struct nstring key = kernel_module_table_key(&kmod);
-		struct hash_pair hp = kernel_module_table_hash(&key);
-		it = kernel_module_table_search_hashed(&kmod_table, &key, hp);
-		if (it.entry) {
-			kmod->next = *it.entry;
-			*it.entry = kmod;
-		} else {
-			if (kernel_module_table_insert_searched(&kmod_table,
-								&kmod, hp,
-								NULL) == -1) {
-				err = &drgn_enomem;
-				goto out;
-			}
-			kmod->next = NULL;
-		}
-	}
-
-	err = report_loaded_kernel_modules(load, num_kmods ? &kmod_table : NULL,
-					   load->load_default ? &depmod : NULL,
-					   use_sys_module);
+	err = kernel_module_set_build_id(module, module_obj, use_sys_module);
 	if (err)
-		goto out;
+		return err;
+	err = kernel_module_set_section_addresses(module, module_obj,
+						  use_sys_module);
+	if (err)
+		return err;
 
-	/* Anything left over was not loaded. */
-	for (it = kernel_module_table_first(&kmod_table); it.entry; ) {
-		struct kernel_module_file *kmod = *it.entry;
-		it = kernel_module_table_delete_iterator(&kmod_table, it);
-		do {
-			err = drgn_debug_info_report_elf(load, kmod->path,
-							 kmod->fd, kmod->elf, 0,
-							 0, kmod->path, NULL);
-			kmod->elf = NULL;
-			kmod->fd = -1;
-			if (err)
-				goto out;
-			kmod = kmod->next;
-		} while (kmod);
-	}
-	err = NULL;
-out:
-	if (depmod.addr)
-		depmod_index_deinit(&depmod);
-	kernel_module_table_deinit(&kmod_table);
-	return err;
+	*ret = no_cleanup_ptr(module);
+	if (new_ret)
+		*new_ret = new;
+	return NULL;
 }
 
 static struct drgn_error *
-report_vmlinux(struct drgn_debug_info_load_state *load,
-	       bool *vmlinux_is_pending)
+drgn_module_find_or_create_linux_kernel_loadable_internal(const struct drgn_object *module_obj,
+							  struct drgn_module **ret,
+							  bool *new_ret,
+							  bool create)
 {
-	static const char * const vmlinux_paths[] = {
-		/*
-		 * The files under /usr/lib/debug should always have debug
-		 * information, so check for those first.
-		 */
-		"/usr/lib/debug/boot/vmlinux-%s",
-		"/usr/lib/debug/lib/modules/%s/vmlinux",
-		"/boot/vmlinux-%s",
-		"/lib/modules/%s/build/vmlinux",
-		"/lib/modules/%s/vmlinux",
-		NULL,
-	};
-	struct drgn_program *prog = load->dbinfo->prog;
 	struct drgn_error *err;
 
-	char *path;
-	int fd;
-	Elf *elf;
-	err = find_elf_file(&path, &fd, &elf, vmlinux_paths,
-			    prog->vmcoreinfo.osrelease);
-	if (err)
-		return drgn_debug_info_report_error(load, NULL, NULL, err);
-	if (!elf) {
-		err = drgn_error_format(DRGN_ERROR_OTHER,
-					"could not find vmlinux for %s",
-					prog->vmcoreinfo.osrelease);
-		return drgn_debug_info_report_error(load, "kernel", NULL, err);
-	}
-
-	uint64_t start, end;
-	err = elf_address_range(elf, prog->vmcoreinfo.kaslr_offset, &start,
-				&end);
-	if (err) {
-		err = drgn_debug_info_report_error(load, path, NULL, err);
-		elf_end(elf);
-		close(fd);
-		free(path);
-		return err;
-	}
-
-	err = drgn_debug_info_report_elf(load, path, fd, elf, start, end,
-					 "kernel", vmlinux_is_pending);
-	free(path);
-	return err;
-}
-
-struct drgn_error *
-linux_kernel_report_debug_info(struct drgn_debug_info_load_state *load)
-{
-	struct drgn_program *prog = load->dbinfo->prog;
-	struct drgn_error *err;
-
-	struct kernel_module_file *kmods;
-	if (load->num_paths) {
-		kmods = malloc_array(load->num_paths, sizeof(*kmods));
-		if (!kmods)
-			return &drgn_enomem;
-	} else {
-		kmods = NULL;
-	}
-
-	/*
-	 * We may need to index vmlinux before we can properly report kernel
-	 * modules. So, this sets aside kernel modules and reports everything
-	 * else.
-	 */
-	size_t num_kmods = 0;
-	bool vmlinux_is_pending = false;
-	for (size_t i = 0; i < load->num_paths; i++) {
-		const char *path = load->paths[i];
-		int fd;
-		Elf *elf;
-		err = open_elf_file(path, &fd, &elf);
-		if (err) {
-			err = drgn_debug_info_report_error(load, path, NULL,
-							   err);
-			if (err)
-				goto out;
-			continue;
-		}
-
-		bool is_vmlinux, is_module;
-		err = identify_kernel_elf(elf, &is_vmlinux, &is_module);
-		if (err) {
-			err = drgn_debug_info_report_error(load, path, NULL,
-							   err);
-			elf_end(elf);
-			close(fd);
-			if (err)
-				goto out;
-			continue;
-		}
-		if (is_module) {
-			struct kernel_module_file *kmod = &kmods[num_kmods++];
-			kmod->path = path;
-			kmod->fd = fd;
-			kmod->elf = elf;
-		} else if (is_vmlinux) {
-			uint64_t start, end;
-			err = elf_address_range(elf,
-						prog->vmcoreinfo.kaslr_offset,
-						&start, &end);
-			if (err) {
-				elf_end(elf);
-				close(fd);
-				err = drgn_debug_info_report_error(load, path,
-								   NULL, err);
-				if (err)
-					goto out;
-				continue;
-			}
-
-			bool is_new;
-			err = drgn_debug_info_report_elf(load, path, fd, elf,
-							 start, end, "kernel",
-							 &is_new);
-			if (err)
-				goto out;
-			if (is_new)
-				vmlinux_is_pending = true;
-		} else {
-			err = drgn_debug_info_report_elf(load, path, fd, elf, 0,
-							 0, NULL, NULL);
-			if (err)
-				goto out;
-		}
-	}
-
-	if (load->load_main && !vmlinux_is_pending &&
-	    !drgn_debug_info_is_indexed(load->dbinfo, "kernel")) {
-		err = report_vmlinux(load, &vmlinux_is_pending);
+	// kernel_module_find_or_create_internal() expects a `struct module`
+	// value.
+	struct drgn_object mod;
+	if (drgn_type_kind(drgn_underlying_type(module_obj->type))
+	    == DRGN_TYPE_POINTER) {
+		drgn_object_init(&mod, drgn_object_program(module_obj));
+		err = drgn_object_dereference(&mod, module_obj);
+		if (!err)
+			err = drgn_object_read(&mod, &mod);
+		module_obj = &mod;
+		if (err)
+			goto out;
+	} else if (module_obj->kind != DRGN_OBJECT_VALUE) {
+		drgn_object_init(&mod, drgn_object_program(module_obj));
+		err = drgn_object_read(&mod, module_obj);
+		module_obj = &mod;
 		if (err)
 			goto out;
 	}
 
-	err = report_kernel_modules(load, kmods, num_kmods, vmlinux_is_pending);
+	err = kernel_module_find_or_create_internal(module_obj, ret, new_ret,
+						    create, false);
 out:
-	for (size_t i = 0; i < num_kmods; i++) {
-		elf_end(kmods[i].elf);
-		if (kmods[i].fd != -1)
-			close(kmods[i].fd);
-	}
-	free(kmods);
+	if (module_obj == &mod)
+		drgn_object_deinit(&mod);
 	return err;
+}
+
+LIBDRGN_PUBLIC struct drgn_error *
+drgn_module_find_linux_kernel_loadable(const struct drgn_object *module_obj,
+				       struct drgn_module **ret)
+{
+	return drgn_module_find_or_create_linux_kernel_loadable_internal(module_obj,
+									 ret,
+									 NULL,
+									 false);
+}
+
+LIBDRGN_PUBLIC struct drgn_error *
+drgn_module_find_or_create_linux_kernel_loadable(const struct drgn_object *module_obj,
+						 struct drgn_module **ret,
+						 bool *new_ret)
+{
+	return drgn_module_find_or_create_linux_kernel_loadable_internal(module_obj,
+									 ret,
+									 new_ret,
+									 true);
+}
+
+static struct drgn_error *
+yield_kernel_module(struct linux_kernel_loaded_module_iterator *it,
+		    struct drgn_module **ret, bool *new_ret)
+{
+	struct drgn_error *err;
+	struct drgn_program *prog = it->it.prog;
+
+	DRGN_OBJECT(mod, prog);
+	for (;;) {
+		uint64_t addr;
+		err = drgn_object_read_unsigned(&it->node, &addr);
+		if (err) {
+list_walk_err:
+			if (!drgn_error_is_fatal(err)) {
+				drgn_error_log_warning(prog, err,
+						       "can't find remaining kernel modules: "
+						       "couldn't read next module: ");
+				drgn_error_destroy(err);
+				*ret = NULL;
+				err = NULL;
+			}
+			return err;
+		}
+		if (addr == it->modules_head) {
+			drgn_log_debug(prog,
+				       "found end of loaded kernel module list");
+			*ret = NULL;
+			return NULL;
+		}
+
+		if (it->module_list_iterations_remaining == 0) {
+			drgn_log_warning(prog,
+					 "can't find remaining kernel modules: "
+					 "too many entries or cycle in modules list");
+			*ret = NULL;
+			return NULL;
+		}
+		it->module_list_iterations_remaining--;
+
+		err = drgn_object_container_of(&mod, &it->node, it->module_type,
+					       "list");
+		if (err)
+			goto list_walk_err;
+
+		err = drgn_object_dereference(&mod, &mod);
+		if (err)
+			goto list_walk_err;
+		// We need several fields from the `struct module`. Especially
+		// for /proc/kcore, it is faster to read the entire structure
+		// (which is <2kB as of Linux 6.5) from the core dump all at
+		// once than it is to read each field individually.
+		err = drgn_object_read(&mod, &mod);
+		if (err)
+			goto list_walk_err;
+
+		err = drgn_object_member(&it->node, &mod, "list");
+		if (err)
+			goto list_walk_err;
+		err = drgn_object_member(&it->node, &it->node, "next");
+		if (err)
+			goto list_walk_err;
+
+		err = kernel_module_find_or_create_internal(&mod, ret, new_ret,
+							    true, true);
+		if (err && !drgn_error_is_fatal(err)) {
+			drgn_error_log_warning(prog, err, "ignoring module: ");
+			drgn_error_destroy(err);
+			continue;
+		}
+		return err;
+	}
+}
+
+static struct drgn_error *
+linux_kernel_loaded_module_iterator_next(struct drgn_module_iterator *_it,
+					 struct drgn_module **ret,
+					 bool *new_ret)
+{
+	struct drgn_error *err;
+	struct linux_kernel_loaded_module_iterator *it =
+		container_of(_it, struct linux_kernel_loaded_module_iterator, it);
+	struct drgn_program *prog = it->it.prog;
+
+	if (!it->yielded_vmlinux) {
+		it->yielded_vmlinux = true;
+		return yield_vmlinux(it, ret, new_ret);
+	}
+
+	// Start the module list walk if we haven't yet.
+	if (!it->module_type.type) {
+		for (int attempt = 1; attempt <= 2; attempt++) {
+			err = drgn_program_find_type(prog, "struct module",
+						     NULL, &it->module_type);
+			if (!err) {
+				err = drgn_program_find_object(prog, "modules",
+							       NULL,
+							       DRGN_FIND_OBJECT_VARIABLE,
+							       &it->node);
+			}
+			if (err && err->code == DRGN_ERROR_LOOKUP) {
+				drgn_error_destroy(err);
+				if (attempt == 1 && prog->dbinfo.main_module) {
+					struct drgn_module *module =
+						prog->dbinfo.main_module;
+				    if (module->debug_file_status
+					== DRGN_MODULE_FILE_DONT_WANT) {
+					    module->debug_file_status =
+						    DRGN_MODULE_FILE_WANT;
+				    }
+				    if (drgn_module_wants_debug_file(module)) {
+					    err = drgn_load_module_debug_info(&module,
+									      &(size_t){1});
+					    if (err)
+						    return err;
+					    continue;
+				    }
+				}
+				if (!prog->dbinfo.main_module
+				    || drgn_module_wants_debug_file(prog->dbinfo.main_module)) {
+					drgn_log_warning(prog,
+							 "can't find loaded modules without kernel debug info");
+				} else {
+					drgn_log_debug(prog,
+						       "kernel does not have loadable module support");
+				}
+				*ret = NULL;
+				return NULL;
+			} else if (err) {
+				return err;
+			}
+		}
+		if (it->node.kind != DRGN_OBJECT_REFERENCE) {
+			drgn_log_warning(prog,
+					 "can't find kernel modules: "
+					 "can't get address of modules list");
+			*ret = NULL;
+			return NULL;
+		}
+		it->modules_head = it->node.address;
+		err = drgn_object_member(&it->node, &it->node, "next");
+		if (!err)
+			err = drgn_object_read(&it->node, &it->node);
+		if (err) {
+			if (drgn_error_is_fatal(err))
+				return err;
+			drgn_error_log_warning(prog, err,
+					       "can't find kernel modules: "
+					       "couldn't read modules list: ");
+			drgn_error_destroy(err);
+			*ret = NULL;
+			return NULL;
+		}
+	}
+
+	return yield_kernel_module(it, ret, new_ret);
+}
+
+struct drgn_error *
+linux_kernel_loaded_module_iterator_create(struct drgn_program *prog,
+					   struct drgn_module_iterator **ret)
+{
+	struct linux_kernel_loaded_module_iterator *it = calloc(1, sizeof(*it));
+	if (!it)
+		return &drgn_enomem;
+	drgn_module_iterator_init(&it->it, prog,
+				  linux_kernel_loaded_module_iterator_destroy,
+				  linux_kernel_loaded_module_iterator_next);
+	it->module_list_iterations_remaining = MAX_MODULE_LIST_ITERATIONS;
+	drgn_object_init(&it->node, prog);
+	*ret = &it->it;
+	return NULL;
 }

@@ -30,16 +30,18 @@ from drgn import (
     container_of,
     sizeof,
 )
+from drgn.helpers import ValidationError
 from drgn.helpers.common.format import escape_ascii_string
 from drgn.helpers.common.prog import takes_program_or_default
 from drgn.helpers.linux.cpumask import for_each_online_cpu
 from drgn.helpers.linux.list import list_for_each_entry
 from drgn.helpers.linux.mm import (
     PageSlab,
+    _get_PageSlab_impl,
     compound_head,
     for_each_page,
+    in_direct_map,
     page_to_virt,
-    pfn_to_virt,
     virt_to_page,
 )
 from drgn.helpers.linux.percpu import per_cpu_ptr
@@ -204,6 +206,19 @@ def print_slab_caches(prog: Program) -> None:
         print(f"{name} ({s.type_.type_name()})0x{s.value_():x}")
 
 
+class SlabCorruptionError(ValidationError):
+    """
+    Error raised when a corruption is encountered in a slab allocator data
+    structure.
+    """
+
+
+class SlabFreelistCycleError(SlabCorruptionError):
+    """
+    Error raised when a cycle is encountered in a slab allocator freelist.
+    """
+
+
 # Between SLUB, SLAB, their respective configuration options, and the
 # differences between kernel versions, there is a lot of state that we need to
 # keep track of to inspect the slab allocator. It isn't pretty, but this class
@@ -213,6 +228,7 @@ class _SlabCacheHelper:
     def __init__(self, slab_cache: Object) -> None:
         self._prog = slab_cache.prog_
         self._slab_cache = slab_cache.read_()
+        self._freelist_error: Optional[Exception] = None
 
     def _page_objects(
         self, page: Object, slab: Object, pointer_type: Type
@@ -220,12 +236,17 @@ class _SlabCacheHelper:
         raise NotImplementedError()
 
     def for_each_allocated_object(self, type: Union[str, Type]) -> Iterator[Object]:
+        if self._freelist_error:
+            raise self._freelist_error
+
         pointer_type = self._prog.pointer_type(self._prog.type(type))
         slab_type = _get_slab_type(self._prog)
-        PG_slab_mask = 1 << self._prog.constant("PG_slab")
+        # Get the underlying implementation directly to avoid overhead on each
+        # page.
+        PageSlab = _get_PageSlab_impl(self._prog)
         for page in for_each_page(self._prog):
             try:
-                if not page.flags & PG_slab_mask:
+                if not PageSlab(page):
                     continue
             except FaultError:
                 continue
@@ -304,9 +325,17 @@ class _SlabCacheHelperSlub(_SlabCacheHelper):
 
             self._freelist_dereference = _try_hardened_freelist_dereference
 
-        def _slub_get_freelist(freelist: Object, freelist_set: Set[int]) -> None:
+        def _slub_get_freelist(
+            freelist_name: Callable[[], str], freelist: Object, freelist_set: Set[int]
+        ) -> None:
             ptr = freelist.value_()
             while ptr:
+                if ptr in freelist_set:
+                    raise SlabFreelistCycleError(
+                        f"{fsdecode(slab_cache.name.string_())} {freelist_name()} "
+                        "freelist contains cycle; "
+                        "may be corrupted or in the middle of update"
+                    )
                 freelist_set.add(ptr)
                 ptr = self._freelist_dereference(ptr + freelist_offset)
 
@@ -322,11 +351,16 @@ class _SlabCacheHelperSlub(_SlabCacheHelper):
             # slab for a CPU is `struct slab *slab`. Before that, it is `struct
             # page *page`.
             cpu_slab_attr = "slab" if hasattr(cpu_slab, "slab") else "page"
-            for cpu in for_each_online_cpu(self._prog):
-                this_cpu_slab = per_cpu_ptr(cpu_slab, cpu)
-                slab = getattr(this_cpu_slab, cpu_slab_attr).read_()
-                if slab and slab.slab_cache == slab_cache:
-                    _slub_get_freelist(this_cpu_slab.freelist, cpu_freelists)
+            try:
+                for cpu in for_each_online_cpu(self._prog):
+                    this_cpu_slab = per_cpu_ptr(cpu_slab, cpu)
+                    slab = getattr(this_cpu_slab, cpu_slab_attr).read_()
+                    if slab and slab.slab_cache == slab_cache:
+                        _slub_get_freelist(
+                            lambda: f"cpu {cpu}", this_cpu_slab.freelist, cpu_freelists
+                        )
+            except (SlabCorruptionError, FaultError) as e:
+                self._freelist_error = e
 
         self._slub_get_freelist = _slub_get_freelist
         self._cpu_freelists = cpu_freelists
@@ -335,7 +369,7 @@ class _SlabCacheHelperSlub(_SlabCacheHelper):
         self, page: Object, slab: Object, pointer_type: Type
     ) -> Iterator[Object]:
         freelist: Set[int] = set()
-        self._slub_get_freelist(slab.freelist, freelist)
+        self._slub_get_freelist(lambda: f"slab {hex(slab)}", slab.freelist, freelist)
         addr = page_to_virt(page).value_() + self._red_left_pad
         end = addr + self._slab_cache_size * slab.objects
         while addr < end:
@@ -350,11 +384,22 @@ class _SlabCacheHelperSlub(_SlabCacheHelper):
             + (addr - first_addr) // self._slab_cache_size * self._slab_cache_size
         )
         if address in self._cpu_freelists:
-            allocated = False
+            allocated: Optional[bool] = False
         else:
             freelist: Set[int] = set()
-            self._slub_get_freelist(slab.freelist, freelist)
-            allocated = address not in freelist
+            try:
+                self._slub_get_freelist(
+                    lambda: f"slab {hex(slab)}", slab.freelist, freelist
+                )
+            except (SlabCorruptionError, FaultError):
+                allocated = False if address in freelist else None
+            else:
+                if address in freelist:
+                    allocated = False
+                elif self._freelist_error:
+                    allocated = None
+                else:
+                    allocated = True
         return SlabObjectInfo(self._slab_cache, slab, address, allocated)
 
 
@@ -461,12 +506,6 @@ def slab_cache_for_each_allocated_object(
 def _find_containing_slab(
     prog: Program, addr: int
 ) -> Optional[Tuple[Object, Object, Object]]:
-    start_addr = pfn_to_virt(prog["min_low_pfn"]).value_()
-    end_addr = (pfn_to_virt(prog["max_low_pfn"]) + prog["PAGE_SIZE"]).value_()
-    if addr < start_addr or addr >= end_addr:
-        # Not a directly mapped address
-        return None
-
     page = virt_to_page(prog, addr)
 
     try:
@@ -513,6 +552,8 @@ def slab_object_info(prog: Program, addr: IntegerLike) -> "Optional[SlabObjectIn
         if not.
     """
     addr = operator.index(addr)
+    if not in_direct_map(prog, addr):
+        return None
     result = _find_containing_slab(prog, addr)
     if result is None:
         return None
@@ -537,11 +578,14 @@ class SlabObjectInfo:
     address: int
     """Address of the slab object."""
 
-    allocated: bool
-    """``True`` if the object is allocated, ``False`` if it is free."""
+    allocated: Optional[bool]
+    """
+    ``True`` if the object is allocated, ``False`` if it is free, or ``None``
+    if not known because the slab cache is corrupted.
+    """
 
     def __init__(
-        self, slab_cache: Object, slab: Object, address: int, allocated: bool
+        self, slab_cache: Object, slab: Object, address: int, allocated: Optional[bool]
     ) -> None:
         self.slab_cache = slab_cache
         self.slab = slab
@@ -565,6 +609,8 @@ def find_containing_slab_cache(prog: Program, addr: IntegerLike) -> Object:
     :return: ``struct kmem_cache *`` containing *addr*, or ``NULL`` if *addr*
         is not from a slab cache.
     """
+    if not in_direct_map(prog, addr):
+        return NULL(prog, "struct kmem_cache *")
     result = _find_containing_slab(prog, operator.index(addr))
     if result is None:
         return NULL(prog, "struct kmem_cache *")

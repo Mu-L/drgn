@@ -209,7 +209,7 @@ static PyObject *StackFrame_symbol(StackFrame *self)
 	err = drgn_stack_frame_symbol(self->trace->trace, self->i, &sym);
 	if (err)
 		return set_drgn_error(err);
-	PyObject *ret = Symbol_wrap(sym, prog);
+	PyObject *ret = Symbol_wrap(sym, (PyObject *)prog);
 	if (!ret) {
 		drgn_symbol_destroy(sym);
 		return NULL;
@@ -272,9 +272,20 @@ static PyObject *StackFrame_registers(StackFrame *self)
 
 static PyObject *StackFrame_get_name(StackFrame *self, void *arg)
 {
-	const char *name = drgn_stack_frame_name(self->trace->trace, self->i);
-	if (name)
-		return PyUnicode_FromString(name);
+	_cleanup_free_ char *name = NULL;
+	struct drgn_error *err = drgn_stack_frame_name(self->trace->trace,
+						       self->i, &name);
+	if (err)
+		return set_drgn_error(err);
+	return PyUnicode_FromString(name);
+}
+
+static PyObject *StackFrame_get_function_name(StackFrame *self, void *arg)
+{
+	const char *function_name =
+		drgn_stack_frame_function_name(self->trace->trace, self->i);
+	if (function_name)
+		return PyUnicode_FromString(function_name);
 	else
 		Py_RETURN_NONE;
 }
@@ -336,6 +347,8 @@ static PyMethodDef StackFrame_methods[] = {
 
 static PyGetSetDef StackFrame_getset[] = {
 	{"name", (getter)StackFrame_get_name, NULL, drgn_StackFrame_name_DOC},
+	{"function_name", (getter)StackFrame_get_function_name, NULL,
+	 drgn_StackFrame_function_name_DOC},
 	{"is_inline", (getter)StackFrame_get_is_inline, NULL,
 	 drgn_StackFrame_is_inline_DOC},
 	{"interrupted", (getter)StackFrame_get_interrupted, NULL,

@@ -4,9 +4,9 @@ import argparse
 import os
 import sys
 import typing
-from typing import Any, Callable, Optional, Sequence, Union
+from typing import Any, Callable, Iterator, Optional, Sequence, Union
 
-from drgn import FaultError, Object, Program, cast, container_of
+from drgn import FaultError, Object, Program, TypeKind, cast, container_of
 from drgn.helpers.linux.cpumask import for_each_possible_cpu
 from drgn.helpers.linux.fs import (
     d_path,
@@ -62,14 +62,11 @@ format_args = {
 if typing.TYPE_CHECKING:
 
     class Visitor(typing.Protocol):  # novermin
-        def visit_file(self, file: Object) -> Optional[str]:
-            ...
+        def visit_file(self, file: Object) -> Optional[str]: ...
 
-        def visit_inode(self, inode: Object) -> Optional[str]:
-            ...
+        def visit_inode(self, inode: Object) -> Optional[str]: ...
 
-        def visit_path(self, path: Object) -> Optional[str]:
-            ...
+        def visit_path(self, path: Object) -> Optional[str]: ...
 
 
 class InodeVisitor:
@@ -121,6 +118,51 @@ class SuperBlockVisitor:
         with ignore_fault:
             match += " " + os.fsdecode(d_path(path))
         return match
+
+
+def super_block_on_bdev(bdev: Object) -> Optional[Object]:
+    prog = bdev.prog_
+
+    # Btrfs is a special case.
+    try:
+        btrfs_fs_type = prog["btrfs_fs_type"]
+    except KeyError:
+        btrfs_fs_type = None
+    else:
+        holder = bdev.bd_holder.read_()
+        if holder != btrfs_fs_type.address_of_():  # type: ignore[union-attr]  # mypy thinks btrfs_fs_type can be None here
+            # Between Linux kernel commits 3bb17a25bcb0 ("btrfs: add get_tree
+            # callback for new mount API") (in v6.8) and 72fa39f5c7a1 ("btrfs:
+            # add btrfs_mount_root() and new file_system_type") (in v4.16), a
+            # different file_system_type is used for the bdev and super blocks.
+            try:
+                btrfs_fs_type = prog["btrfs_root_fs_type"]
+            except KeyError:
+                btrfs_fs_type = None
+            else:
+                if holder != btrfs_fs_type.address_of_():
+                    btrfs_fs_type = None
+
+    if btrfs_fs_type is None:
+        for sb in list_for_each_entry(
+            "struct super_block", prog["super_blocks"].address_of_(), "s_list"
+        ):
+            if sb.s_bdev == bdev:
+                return sb
+    else:
+        fs_info_type = prog.type("struct btrfs_fs_info *")
+        for sb in hlist_for_each_entry(
+            "struct super_block", btrfs_fs_type.fs_supers.address_of_(), "s_instances"
+        ):
+            fs_info = cast(fs_info_type, sb.s_fs_info)
+            for device in list_for_each_entry(
+                "struct btrfs_device",
+                fs_info.fs_devices.devices.address_of_(),
+                "dev_list",
+            ):
+                if device.bdev == bdev:
+                    return sb
+    return None
 
 
 def visit_tasks(
@@ -355,8 +397,28 @@ def visit_uprobes(prog: Program, visitor: "Visitor") -> None:
                 continue
             found_consumer = False
             with warn_on_fault("iterating uprobe consumers"):
-                consumer = uprobe.consumers.read_()
-                while consumer:
+                consumer_list = uprobe.consumers
+                # Since Linux kernel commit cc01bd044e6a ("uprobes: travers
+                # uprobe's consumer list locklessly under SRCU protection") (in
+                # v6.12), struct uprobe::consumers is a struct list_head.
+                # Before that, it was a hand-rolled singly-linked list.
+                if consumer_list.type_.kind == TypeKind.STRUCT:
+                    consumers = list_for_each_entry(
+                        "struct uprobe_consumer",
+                        consumer_list.address_of_(),
+                        "cons_node",
+                    )
+                else:
+
+                    def for_each_consumer(first: Object) -> Iterator[Object]:
+                        consumer = first.read_()
+                        while consumer:
+                            yield consumer
+                            consumer = consumer.next.read_()
+
+                    consumers = for_each_consumer(consumer_list)
+
+                for consumer in consumers:
                     handler = consumer.handler.read_()
                     if handler == uprobe_dispatcher:
                         tu = container_of(consumer, "struct trace_uprobe", "consumer")
@@ -416,7 +478,6 @@ def visit_uprobes(prog: Program, visitor: "Visitor") -> None:
                         print(
                             f"unknown uprobe consumer {consumer.format_(**format_args)}"
                         )
-                    consumer = consumer.next.read_()
             if not found_consumer:
                 print(f"unknown uprobe {uprobe.format_(**format_args)} {match}")
 
@@ -453,6 +514,11 @@ def main(prog: Program, argv: Sequence[str]) -> None:
         "--super-block",
         metavar="PATH",
         help="find references to the filesystem (super block) containing the given path",
+    )
+    object_group.add_argument(
+        "--super-block-on-block-device",
+        metavar="PATH",
+        help="find references to the filesystem (super block) on the block device at the given path",
     )
     object_group.add_argument(
         "--super-block-pointer",
@@ -504,6 +570,28 @@ def main(prog: Program, argv: Sequence[str]) -> None:
             visitor = SuperBlockVisitor(
                 fget(find_task(prog, os.getpid()), fd).f_inode.i_sb
             )
+        finally:
+            os.close(fd)
+    elif args.super_block_on_block_device:
+        fd = os.open(
+            args.super_block_on_block_device,
+            # O_PATH doesn't look up the bdev inode, so we can't use it here.
+            os.O_RDONLY | (0 if args.dereference else os.O_NOFOLLOW),
+        )
+        try:
+            file = fget(find_task(prog, os.getpid()), fd)
+            if file.f_op != prog["def_blk_fops"].address_of_():
+                sys.exit(
+                    f"{args.super_block_on_block_device} is not a block device. Do you need --dereference?"
+                )
+            sb = super_block_on_bdev(
+                container_of(
+                    file.f_mapping.host, "struct bdev_inode", "vfs_inode"
+                ).bdev.address_of_()
+            )
+            if sb is None:
+                sys.exit(f"no filesystem found on {args.super_block_on_block_device}")
+            visitor = SuperBlockVisitor(sb)
         finally:
             os.close(fd)
     elif args.super_block_pointer is not None:

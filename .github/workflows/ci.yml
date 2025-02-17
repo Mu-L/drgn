@@ -11,10 +11,20 @@ on:
         type: boolean
         default: false
         required: true
+      test_all_kernel_flavors:
+        description: "Run tests on all kernel flavors"
+        type: boolean
+        default: false
+        required: true
   workflow_call:
     inputs:
       test_all_python_versions:
         description: "Run tests on all Python versions"
+        type: boolean
+        default: false
+        required: true
+      test_all_kernel_flavors:
+        description: "Run tests on all kernel flavors"
         type: boolean
         default: false
         required: true
@@ -39,9 +49,9 @@ jobs:
       CC: ${{ matrix.cc }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
           allow-prereleases: true
@@ -53,23 +63,23 @@ jobs:
           fi
       - name: Install dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install dwarves libelf-dev libdw-dev qemu-kvm zstd ${{ matrix.cc == 'clang' && 'libomp-$(clang --version | sed -rn "s/.*clang version ([0-9]+).*/\\1/p")-dev' || '' }}
-          pip install pyroute2 ${USE_PRE_COMMIT/1/pre-commit}
+          sudo apt-get update -y
+          sudo apt-get install -y btrfs-progs check dwarves libelf-dev libdw-dev qemu-kvm zstd ${{ matrix.cc == 'clang' && 'libomp-$(clang --version | sed -rn "s/.*clang version ([0-9]+).*/\\1/p")-dev' || '' }}
+          pip install pyroute2 setuptools ${USE_PRE_COMMIT/1/pre-commit}
       - name: Generate version.py
         run: python setup.py --version
       - name: Check with mypy
         if: ${{ env.USE_PRE_COMMIT == '1' }}
         run: pre-commit run --all-files mypy
       - name: Build and test with ${{ matrix.cc }}
-        run: CONFIGURE_FLAGS="--enable-compiler-warnings=error" python setup.py test -K
+        run: CONFIGURE_FLAGS="--enable-compiler-warnings=error" python setup.py test -K ${{ inputs.test_all_kernel_flavors && '-F' || '' }}
 
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.x'
       - name: Install dependencies

@@ -7,9 +7,12 @@ Programs
 --------
 
 .. drgndoc:: Program
-    :exclude: (void|int|bool|float|struct|union|class|enum|typedef|pointer|array|function)_type
+    :exclude: (void|int|bool|float|struct|union|class|enum|typedef|pointer|array|function)_type|(main|shared_library|vdso|relocatable|linux_kernel_loadable|extra)_module
 .. drgndoc:: ProgramFlags
 .. drgndoc:: FindObjectFlags
+
+.. drgndoc:: DebugInfoOptions
+.. drgndoc:: KmodSearchMethod
 
 .. drgndoc:: Thread
 
@@ -99,6 +102,7 @@ Objects
 .. drgndoc:: Object
 .. drgndoc:: NULL
 .. drgndoc:: cast
+.. drgndoc:: implicit_convert
 .. drgndoc:: reinterpret
 .. drgndoc:: container_of
 
@@ -108,6 +112,7 @@ Symbols
 .. drgndoc:: Symbol
 .. drgndoc:: SymbolBinding
 .. drgndoc:: SymbolKind
+.. drgndoc:: SymbolIndex
 
 Stack Traces
 ------------
@@ -130,8 +135,10 @@ Types
 .. drgndoc:: TypeParameter
 .. drgndoc:: TypeTemplateParameter
 .. drgndoc:: TypeKind
+.. drgndoc:: TypeKindSet
 .. drgndoc:: PrimitiveType
 .. drgndoc:: Qualifiers
+.. drgndoc:: alignof
 .. drgndoc:: offsetof
 
 .. _api-type-constructors:
@@ -155,6 +162,44 @@ can be used just like types obtained from :meth:`Program.type()`.
 .. drgndoc:: Program.array_type
 .. drgndoc:: Program.function_type
 
+Modules
+-------
+
+.. drgndoc:: Module
+.. drgndoc:: MainModule
+.. drgndoc:: SharedLibraryModule
+.. drgndoc:: VdsoModule
+.. drgndoc:: RelocatableModule
+.. drgndoc:: ExtraModule
+.. drgndoc:: ModuleFileStatus
+.. drgndoc:: WantedSupplementaryFile
+.. drgndoc:: SupplementaryFileKind
+
+.. _api-module-constructors:
+
+Module Lookups/Constructors
+^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+For each module type, there is a corresponding method to create a module of
+that type or find one that was previously created::
+
+    >>> prog.extra_module("foo", 1234)
+    Traceback (most recent call last):
+      ...
+    LookupError: module not found
+    >>> prog.extra_module("foo", 1234, create=True)
+    (prog.extra_module(name='foo', id=0x4d2), True)
+    >>> prog.extra_module("foo", 1234)
+    >>> prog.extra_module("foo", 1234, create=True)
+    (prog.extra_module(name='foo', id=0x4d2), False)
+
+.. drgndoc:: Program.main_module
+.. drgndoc:: Program.shared_library_module
+.. drgndoc:: Program.vdso_module
+.. drgndoc:: Program.relocatable_module
+.. drgndoc:: Program.linux_kernel_loadable_module
+.. drgndoc:: Program.extra_module
+
 Miscellaneous
 -------------
 
@@ -176,11 +221,46 @@ CLI
 
 .. drgndoc:: cli
 
+.. _plugins:
+
+Plugins
+-------
+
+drgn can be extended with plugins. A drgn plugin is a Python module defining
+one or more hook functions that are called at specific times.
+
+By default, drgn loads installed modules registered as :ref:`entry points
+<writing-plugins>` for the ``drgn.plugins`` group. The :envvar:`DRGN_PLUGINS`
+and :envvar:`DRGN_DISABLE_PLUGINS` environment variables can be used to
+configure this.
+
+The following hooks are currently defined:
+
+.. py:currentmodule:: None
+
+.. function:: drgn_prog_set(prog: drgn.Program) -> None
+
+    Called after the program target has been set (e.g., one of
+    :meth:`drgn.Program.set_core_dump()`, :meth:`drgn.Program.set_kernel()`, or
+    :meth:`drgn.Program.set_pid()` has been called).
+
+A ``drgn_priority`` integer attribute can be assigned to a hook function to
+define when it is called relative to other plugins. Hook functions with lower
+``drgn_priority`` values are called earlier. Functions with equal
+``drgn_priority`` values are called in an unspecified order. The default if not
+defined is 50.
+
+See :ref:`writing-plugins` for an example.
+
 Logging
 -------
 
 drgn logs using the standard :mod:`logging` module to a logger named
 ``"drgn"``.
+
+drgn will also display progress bars on standard error if standard error is a
+terminal, the ``"drgn"`` logger has a :class:`~logging.StreamHandler` for
+``stderr``, and its log level is less than or equal to ``WARNING``.
 
 Thread Safety
 -------------
