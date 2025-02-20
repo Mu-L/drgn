@@ -1315,8 +1315,6 @@ class TestConversions(MockProgramTestCase):
         self.assertTrue(Object(self.prog, "int *", value=0xFFFF0000))
         self.assertFalse(Object(self.prog, "int *", value=0x0))
 
-        self.assertTrue(Object(self.prog, "int []", address=0))
-
         self.assertRaisesRegex(
             TypeError,
             "cannot convert 'struct point' to bool",
@@ -1777,9 +1775,14 @@ class TestGenericOperators(MockProgramTestCase):
             obj,
         )
 
-    def test_cast_invalid(self):
-        obj = Object(self.prog, "int", value=1)
-        self.assertRaisesRegex(TypeError, "cannot cast to void type", cast, "void", obj)
+    def test_cast_to_incomplete_type(self):
+        self.assertRaisesRegex(
+            TypeError,
+            "cannot cast to incomplete enumerated type",
+            cast,
+            self.prog.enum_type("foo"),
+            Object(self.prog, "int", 1),
+        )
 
     def test_reinterpret_reference(self):
         obj = Object(self.prog, "int", address=0xFFFF0000)

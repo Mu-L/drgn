@@ -8,7 +8,7 @@
 #include <string.h>
 
 #include "cleanup.h"
-#include "drgn.h"
+#include "drgn_internal.h"
 #include "error.h"
 #include "language.h"
 #include "minmax.h"
@@ -18,11 +18,11 @@
 #include "type.h"
 #include "util.h"
 
-#define DRGN_OBJECT_INITIALIZER(prog)			\
-	(struct drgn_object){				\
-		.type = drgn_void_type(prog, NULL),	\
-		.encoding = DRGN_OBJECT_ENCODING_NONE,	\
-		.kind = DRGN_OBJECT_ABSENT,		\
+#define DRGN_OBJECT_INITIALIZER(prog)				\
+	(struct drgn_object){					\
+		.type = &(prog)->void_types[DRGN_LANGUAGE_C],	\
+		.encoding = DRGN_OBJECT_ENCODING_NONE,		\
+		.kind = DRGN_OBJECT_ABSENT,			\
 	}
 
 LIBDRGN_PUBLIC
@@ -94,7 +94,7 @@ drgn_object_type_impl(struct drgn_type *type, struct drgn_type *underlying_type,
 	}
 
 	struct drgn_type *compatible_type = underlying_type;
-	SWITCH_ENUM(drgn_type_kind(compatible_type),
+	SWITCH_ENUM(drgn_type_kind(compatible_type)) {
 	case DRGN_TYPE_ENUM:
 		if (!drgn_type_is_complete(compatible_type)) {
 			ret->encoding = DRGN_OBJECT_ENCODING_INCOMPLETE_INTEGER;
@@ -161,7 +161,9 @@ drgn_object_type_impl(struct drgn_type *type, struct drgn_type *underlying_type,
 		break;
 	// This is already the underlying type, so it can't be a typedef.
 	case DRGN_TYPE_TYPEDEF:
-	)
+	default:
+		UNREACHABLE();
+	}
 
 	if (bit_field_size != 0
 	    && drgn_type_kind(compatible_type) != DRGN_TYPE_INT
@@ -392,12 +394,12 @@ drgn_object_set_from_buffer_internal(struct drgn_object *res,
 			  type->little_endian);
 		if (type->encoding == DRGN_OBJECT_ENCODING_SIGNED_BIG
 		    && type->bit_size % 8 != 0) {
-			int8_t *p;
+			int8_t *dst_p;
 			if (type->little_endian)
-				p = (int8_t *)dst + size - 1;
+				dst_p = (int8_t *)dst + size - 1;
 			else
-				p = (int8_t *)dst;
-			*p = truncate_signed8(*p, type->bit_size % 8);
+				dst_p = (int8_t *)dst;
+			*dst_p = truncate_signed8(*dst_p, type->bit_size % 8);
 		}
 	} else if (drgn_object_encoding_is_complete(type->encoding)) {
 		if (type->encoding == DRGN_OBJECT_ENCODING_FLOAT
@@ -450,7 +452,7 @@ drgn_object_set_reference_internal(struct drgn_object *res,
 	address &= address_mask;
 	bit_offset %= 8;
 	if (bit_offset != 0) {
-		SWITCH_ENUM(type->encoding,
+		SWITCH_ENUM(type->encoding) {
 		case DRGN_OBJECT_ENCODING_SIGNED:
 		case DRGN_OBJECT_ENCODING_UNSIGNED:
 		case DRGN_OBJECT_ENCODING_SIGNED_BIG:
@@ -463,7 +465,9 @@ drgn_object_set_reference_internal(struct drgn_object *res,
 		case DRGN_OBJECT_ENCODING_INCOMPLETE_BUFFER:
 			return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
 						 "non-scalar must be byte-aligned");
-		)
+		default:
+			UNREACHABLE();
+		}
 	}
 	if (type->bit_size > UINT64_MAX - bit_offset) {
 		return drgn_error_format(DRGN_ERROR_OVERFLOW,
@@ -501,7 +505,7 @@ drgn_object_set_absent(struct drgn_object *res,
 	err = drgn_object_type(qualified_type, bit_field_size, &type);
 	if (err)
 		return err;
-	drgn_object_reinit(res, &type, DRGN_OBJECT_ABSENT);
+	drgn_object_set_absent_internal(res, &type);
 	return NULL;
 }
 
@@ -516,7 +520,7 @@ drgn_object_copy(struct drgn_object *res, const struct drgn_object *obj)
 					 "objects are from different programs");
 	}
 
-	SWITCH_ENUM(obj->kind,
+	SWITCH_ENUM(obj->kind) {
 	case DRGN_OBJECT_VALUE:
 		if (obj->encoding == DRGN_OBJECT_ENCODING_BUFFER
 		    || obj->encoding == DRGN_OBJECT_ENCODING_SIGNED_BIG
@@ -554,29 +558,24 @@ drgn_object_copy(struct drgn_object *res, const struct drgn_object *obj)
 		drgn_object_reinit_copy(res, obj);
 		res->kind = DRGN_OBJECT_ABSENT;
 		break;
-	)
+	default:
+		UNREACHABLE();
+	}
 	return NULL;
 }
 
-LIBDRGN_PUBLIC struct drgn_error *
-drgn_object_slice(struct drgn_object *res, const struct drgn_object *obj,
-		  struct drgn_qualified_type qualified_type,
-		  uint64_t bit_offset, uint64_t bit_field_size)
+struct drgn_error *
+drgn_object_slice_internal(struct drgn_object *res,
+			   const struct drgn_object *obj,
+			   const struct drgn_object_type *type,
+			   uint64_t bit_offset, uint64_t bit_field_size)
 {
 	struct drgn_error *err;
-	if (drgn_object_program(res) != drgn_object_program(obj)) {
-		return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
-					 "objects are from different programs");
-	}
-	struct drgn_object_type type;
-	err = drgn_object_type(qualified_type, bit_field_size, &type);
-	if (err)
-		return err;
 
-	SWITCH_ENUM(obj->kind,
+	SWITCH_ENUM(obj->kind) {
 	case DRGN_OBJECT_VALUE: {
 		uint64_t bit_end;
-		if (__builtin_add_overflow(bit_offset, type.bit_size, &bit_end)
+		if (__builtin_add_overflow(bit_offset, type->bit_size, &bit_end)
 		    || bit_end > obj->bit_size) {
 			return drgn_error_create(DRGN_ERROR_OUT_OF_BOUNDS,
 						 "out of bounds of value");
@@ -599,20 +598,40 @@ drgn_object_slice(struct drgn_object *res, const struct drgn_object *obj,
 			if (err)
 				return err;
 		}
-		return drgn_object_set_from_buffer_internal(res, &type, buf,
+		return drgn_object_set_from_buffer_internal(res, type, buf,
 							    bit_offset);
 	}
 	case DRGN_OBJECT_REFERENCE:
 		// obj->bit_offset + bit_offset can overflow, so apply the
 		// byte-aligned part of bit_offset now.
-		return drgn_object_set_reference_internal(res, &type,
+		return drgn_object_set_reference_internal(res, type,
 							  obj->address
 							  + (bit_offset / 8),
 							  obj->bit_offset
 							  + (bit_offset % 8));
 	case DRGN_OBJECT_ABSENT:
 		return &drgn_error_object_absent;
-	)
+	default:
+		UNREACHABLE();
+	}
+}
+
+LIBDRGN_PUBLIC struct drgn_error *
+drgn_object_slice(struct drgn_object *res, const struct drgn_object *obj,
+		  struct drgn_qualified_type qualified_type,
+		  uint64_t bit_offset, uint64_t bit_field_size)
+{
+	struct drgn_error *err;
+	if (drgn_object_program(res) != drgn_object_program(obj)) {
+		return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
+					 "objects are from different programs");
+	}
+	struct drgn_object_type type;
+	err = drgn_object_type(qualified_type, bit_field_size, &type);
+	if (err)
+		return err;
+	return drgn_object_slice_internal(res, obj, &type, bit_offset,
+					  bit_field_size);
 }
 
 LIBDRGN_PUBLIC struct drgn_error *
@@ -752,7 +771,7 @@ drgn_object_read(struct drgn_object *res, const struct drgn_object *obj)
 {
 	struct drgn_error *err;
 
-	SWITCH_ENUM(obj->kind,
+	SWITCH_ENUM(obj->kind) {
 	case DRGN_OBJECT_VALUE:
 		return drgn_object_copy(res, obj);
 	case DRGN_OBJECT_REFERENCE: {
@@ -771,7 +790,9 @@ drgn_object_read(struct drgn_object *res, const struct drgn_object *obj)
 	}
 	case DRGN_OBJECT_ABSENT:
 		return &drgn_error_object_absent;
-	)
+	default:
+		UNREACHABLE();
+	}
 }
 
 LIBDRGN_PUBLIC struct drgn_error *
@@ -780,7 +801,7 @@ drgn_object_read_value(const struct drgn_object *obj, union drgn_value *value,
 {
 	struct drgn_error *err;
 
-	SWITCH_ENUM(obj->kind,
+	SWITCH_ENUM(obj->kind) {
 	case DRGN_OBJECT_VALUE:
 		*ret = &obj->value;
 		return NULL;
@@ -791,7 +812,9 @@ drgn_object_read_value(const struct drgn_object *obj, union drgn_value *value,
 		return err;
 	case DRGN_OBJECT_ABSENT:
 		return &drgn_error_object_absent;
-	)
+	default:
+		UNREACHABLE();
+	}
 }
 
 LIBDRGN_PUBLIC struct drgn_error *
@@ -804,7 +827,7 @@ drgn_object_read_bytes(const struct drgn_object *obj, void *buf)
 						  obj->type);
 	}
 
-	SWITCH_ENUM(obj->kind,
+	SWITCH_ENUM(obj->kind) {
 	case DRGN_OBJECT_VALUE:
 		if (obj->encoding == DRGN_OBJECT_ENCODING_BUFFER
 		    || obj->encoding == DRGN_OBJECT_ENCODING_SIGNED_BIG
@@ -891,7 +914,9 @@ drgn_object_read_bytes(const struct drgn_object *obj, void *buf)
 	}
 	case DRGN_OBJECT_ABSENT:
 		return &drgn_error_object_absent;
-	)
+	default:
+		UNREACHABLE();
+	}
 }
 
 static struct drgn_error *
@@ -1032,7 +1057,7 @@ drgn_object_read_c_string(const struct drgn_object *obj, char **ret)
 		} else {
 			max_size = SIZE_MAX;
 		}
-		SWITCH_ENUM(obj->kind,
+		SWITCH_ENUM(obj->kind) {
 		case DRGN_OBJECT_VALUE: {
 			const char *buf;
 			uint64_t value_size;
@@ -1058,7 +1083,9 @@ drgn_object_read_c_string(const struct drgn_object *obj, char **ret)
 			break;
 		case DRGN_OBJECT_ABSENT:
 			return &drgn_error_object_absent;
-		)
+		default:
+			UNREACHABLE();
+		}
 		break;
 	default:
 		return drgn_type_error("string() argument must be an array or pointer, not '%s'",
@@ -1338,6 +1365,20 @@ drgn_object_cast(struct drgn_object *res,
 }
 
 LIBDRGN_PUBLIC struct drgn_error *
+drgn_object_implicit_convert(struct drgn_object *res,
+			     struct drgn_qualified_type qualified_type,
+			     const struct drgn_object *obj)
+{
+	const struct drgn_language *lang = drgn_type_language(qualified_type.type);
+
+	if (drgn_object_program(res) != drgn_object_program(obj)) {
+		return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
+					 "objects are from different programs");
+	}
+	return lang->op_implicit_convert(res, qualified_type, obj);
+}
+
+LIBDRGN_PUBLIC struct drgn_error *
 drgn_object_reinterpret(struct drgn_object *res,
 			struct drgn_qualified_type qualified_type,
 			const struct drgn_object *obj)
@@ -1394,20 +1435,14 @@ struct drgn_error *drgn_error_binary_op(const char *op_name,
 					struct drgn_operand_type *rhs_type)
 {
 	struct drgn_error *err;
-	struct drgn_qualified_type lhs_qualified_type = {
-		.type = lhs_type->type,
-		.qualifiers = lhs_type->qualifiers,
-	};
-	struct drgn_qualified_type rhs_qualified_type = {
-		.type = rhs_type->type,
-		.qualifiers = rhs_type->qualifiers,
-	};
 	_cleanup_free_ char *lhs_type_name = NULL;
-	err = drgn_format_type_name(lhs_qualified_type, &lhs_type_name);
+	err = drgn_format_type_name(drgn_operand_type_qualified(lhs_type),
+				    &lhs_type_name);
 	if (err)
 		return err;
 	_cleanup_free_ char *rhs_type_name = NULL;
-	err = drgn_format_type_name(rhs_qualified_type, &rhs_type_name);
+	err = drgn_format_type_name(drgn_operand_type_qualified(rhs_type),
+				    &rhs_type_name);
 	if (err)
 		return err;
 	return drgn_error_format(DRGN_ERROR_TYPE,
@@ -1420,12 +1455,9 @@ struct drgn_error *drgn_error_unary_op(const char *op_name,
 				       struct drgn_operand_type *type)
 {
 	struct drgn_error *err;
-	struct drgn_qualified_type qualified_type = {
-		.type = type->type,
-		.qualifiers = type->qualifiers,
-	};
 	_cleanup_free_ char *type_name = NULL;
-	err = drgn_format_type_name(qualified_type, &type_name);
+	err = drgn_format_type_name(drgn_operand_type_qualified(type),
+				    &type_name);
 	if (err)
 		return err;
 	return drgn_error_format(DRGN_ERROR_TYPE,
@@ -1494,7 +1526,7 @@ drgn_object_address_of(struct drgn_object *res, const struct drgn_object *obj)
 					 "objects are from different programs");
 	}
 
-	SWITCH_ENUM(obj->kind,
+	SWITCH_ENUM(obj->kind) {
 	case DRGN_OBJECT_VALUE:
 		return drgn_error_format(DRGN_ERROR_INVALID_ARGUMENT,
 					 "cannot take address of value");
@@ -1502,7 +1534,9 @@ drgn_object_address_of(struct drgn_object *res, const struct drgn_object *obj)
 		break;
 	case DRGN_OBJECT_ABSENT:
 		return &drgn_error_object_absent;
-	)
+	default:
+		UNREACHABLE();
+	}
 
 	if (obj->is_bit_field || obj->bit_offset) {
 		return drgn_error_format(DRGN_ERROR_INVALID_ARGUMENT,
@@ -1723,7 +1757,7 @@ static struct drgn_error *pointer_operand(const struct drgn_object *ptr,
 	case DRGN_OBJECT_ENCODING_BUFFER:
 	case DRGN_OBJECT_ENCODING_NONE:
 	case DRGN_OBJECT_ENCODING_INCOMPLETE_BUFFER:
-		SWITCH_ENUM(ptr->kind,
+		SWITCH_ENUM(ptr->kind) {
 		case DRGN_OBJECT_VALUE:
 			return drgn_error_format(DRGN_ERROR_INVALID_ARGUMENT,
 						 "cannot get address of value");
@@ -1732,7 +1766,9 @@ static struct drgn_error *pointer_operand(const struct drgn_object *ptr,
 			return NULL;
 		case DRGN_OBJECT_ABSENT:
 			return &drgn_error_object_absent;
-		)
+		default:
+			UNREACHABLE();
+		}
 	default:
 		return drgn_error_create(DRGN_ERROR_TYPE,
 					 "invalid operand type for pointer arithmetic");
@@ -1740,23 +1776,18 @@ static struct drgn_error *pointer_operand(const struct drgn_object *ptr,
 }
 
 struct drgn_error *drgn_op_cast(struct drgn_object *res,
-				struct drgn_qualified_type qualified_type,
+				const struct drgn_object_type *type,
 				const struct drgn_object *obj,
 				const struct drgn_operand_type *obj_type)
 {
 	struct drgn_error *err;
 
-	struct drgn_object_type type;
-	err = drgn_object_type(qualified_type, 0, &type);
-	if (err)
-		goto err;
-
 	bool is_pointer = (drgn_type_kind(obj_type->underlying_type) ==
 			   DRGN_TYPE_POINTER);
-	switch (type.encoding) {
+	switch (type->encoding) {
 	case DRGN_OBJECT_ENCODING_BUFFER:
 		return drgn_qualified_type_error("cannot cast to '%s'",
-						 qualified_type);
+						 drgn_object_type_qualified(type));
 	case DRGN_OBJECT_ENCODING_SIGNED: {
 		union {
 			int64_t svalue;
@@ -1765,24 +1796,24 @@ struct drgn_error *drgn_op_cast(struct drgn_object *res,
 		if (is_pointer) {
 			err = pointer_operand(obj, &tmp.uvalue);
 		} else {
-			err = drgn_object_convert_signed(obj, type.bit_size,
+			err = drgn_object_convert_signed(obj, type->bit_size,
 							 &tmp.svalue);
 		}
 		if (err)
 			goto err;
-		return drgn_object_set_signed_internal(res, &type, tmp.svalue);
+		return drgn_object_set_signed_internal(res, type, tmp.svalue);
 	}
 	case DRGN_OBJECT_ENCODING_UNSIGNED: {
 		uint64_t uvalue;
 		if (is_pointer) {
 			err = pointer_operand(obj, &uvalue);
 		} else {
-			err = drgn_object_convert_unsigned(obj, type.bit_size,
+			err = drgn_object_convert_unsigned(obj, type->bit_size,
 							   &uvalue);
 		}
 		if (err)
 			goto err;
-		return drgn_object_set_unsigned_internal(res, &type, uvalue);
+		return drgn_object_set_unsigned_internal(res, type, uvalue);
 	}
 	case DRGN_OBJECT_ENCODING_FLOAT: {
 		if (is_pointer)
@@ -1792,12 +1823,12 @@ struct drgn_error *drgn_op_cast(struct drgn_object *res,
 		err = drgn_object_convert_float(obj, &fvalue);
 		if (err)
 			goto err;
-		return drgn_object_set_float_internal(res, &type, fvalue);
+		return drgn_object_set_float_internal(res, type, fvalue);
 	}
 	default:
-		if (!drgn_object_encoding_is_complete(type.encoding)) {
+		if (!drgn_object_encoding_is_complete(type->encoding)) {
 			return drgn_error_incomplete_type("cannot cast to %s type",
-							  type.type);
+							  type->type);
 		}
 		goto type_error;
 	}
@@ -1809,21 +1840,10 @@ err:
 	}
 	return err;
 
-type_error:;
-	struct drgn_qualified_type from_qualified_type = {
-		.type = obj_type->type,
-		.qualifiers = obj_type->qualifiers,
-	};
-	_cleanup_free_ char *to_type_name = NULL;
-	err = drgn_format_type_name(qualified_type, &to_type_name);
-	if (err)
-		return err;
-	_cleanup_free_ char *from_type_name = NULL;
-	err = drgn_format_type_name(from_qualified_type, &from_type_name);
-	if (err)
-		return err;
-	return drgn_error_format(DRGN_ERROR_TYPE, "cannot convert '%s' to '%s'",
-				 from_type_name, to_type_name);
+type_error:
+	return drgn_2_qualified_types_error("cannot convert '%s' to '%s'",
+					    drgn_operand_type_qualified(obj_type),
+					    drgn_object_type_qualified(type));
 }
 
 /*

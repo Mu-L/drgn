@@ -46,17 +46,7 @@ UPROBE_TYPE_PATH = Path("/sys/bus/event_source/devices/uprobe/type")
 class TestFsRefs(LinuxKernelTestCase):
     def setUp(self):
         super().setUp()
-        self._tmpdir = tempfile.TemporaryDirectory()
-        self._tmp = Path(self._tmpdir.name)
-
-    def tearDown(self):
-        try:
-            tmpdir = self._tmpdir
-        except AttributeError:
-            pass
-        else:
-            tmpdir.cleanup()
-        super().tearDown()
+        self._tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
 
     def run_and_capture(self, *args):
         f = io.StringIO()
@@ -215,6 +205,31 @@ class TestFsRefs(LinuxKernelTestCase):
                         hex(fget(find_task(self.prog, os.getpid()), fd1).f_inode.i_sb),
                     ),
                 )
+
+    @skip_unless_have_test_disk
+    def test_super_block_on_block_device(self):
+        disk = os.environ["DRGN_TEST_DISK"]
+        for fstype, mkfs in (
+            ("ext2", ("mke2fs", "-qF")),
+            ("btrfs", ("mkfs.btrfs", "-qf")),
+        ):
+            with self.subTest(fstype=fstype):
+                subprocess.check_call([*mkfs, disk])
+
+                with contextlib.ExitStack() as exit_stack:
+                    mount(disk, self._tmp, fstype)
+                    exit_stack.callback(umount, self._tmp)
+
+                    self.assertIn(
+                        f"mount {self._tmp} ",
+                        self.run_and_capture(
+                            "--check",
+                            "mounts",
+                            "--dereference",
+                            "--super-block-on-block-device",
+                            str(disk),
+                        ),
+                    )
 
     def test_binfmt_misc(self):
         for mnt in iter_mounts():

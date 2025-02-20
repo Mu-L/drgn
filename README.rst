@@ -1,19 +1,21 @@
 drgn
 ====
 
-.. image:: https://img.shields.io/pypi/v/drgn
+|pypi badge| |ci badge| |docs badge| |black badge|
+
+.. |pypi badge| image:: https://img.shields.io/pypi/v/drgn
     :target: https://pypi.org/project/drgn/
     :alt: PyPI
 
-.. image:: https://github.com/osandov/drgn/workflows/CI/badge.svg
+.. |ci badge| image:: https://github.com/osandov/drgn/workflows/CI/badge.svg
     :target: https://github.com/osandov/drgn/actions
     :alt: CI Status
 
-.. image:: https://readthedocs.org/projects/drgn/badge/?version=latest
+.. |docs badge| image:: https://readthedocs.org/projects/drgn/badge/?version=latest
     :target: https://drgn.readthedocs.io/en/latest/?badge=latest
     :alt: Documentation Status
 
-.. image:: https://img.shields.io/badge/code%20style-black-000000.svg
+.. |black badge| image:: https://img.shields.io/badge/code%20style-black-000000.svg
     :target: https://github.com/psf/black
 
 .. start-introduction
@@ -64,7 +66,7 @@ Package Manager
 
 drgn can be installed using the package manager on some Linux distributions.
 
-.. image:: https://repology.org/badge/vertical-allrepos/drgn.svg
+.. image:: https://repology.org/badge/vertical-allrepos/drgn.svg?exclude_unsupported=1
     :target: https://repology.org/project/drgn/versions
     :alt: Packaging Status
 
@@ -82,16 +84,40 @@ drgn can be installed using the package manager on some Linux distributions.
 
       $ sudo dnf install drgn
 
+* Oracle Linux >= 8
+
+  Enable the ``ol8_addons`` or ``ol9_addons`` repository and install drgn:
+
+  .. code-block:: console
+
+      $ sudo dnf config-manager --enable ol8_addons  # OR: ol9_addons
+      $ sudo dnf install drgn
+
+  Drgn is also available for Python versions in application streams. For
+  example, use ``dnf install python3.12-drgn`` to install drgn for Python 3.12.
+  See the documentation for drgn in `Oracle Linux 9
+  <https://docs.oracle.com/en/operating-systems/oracle-linux/9/drgn/how_to_install_drgn.html>`_
+  and `Oracle Linux 8
+  <https://docs.oracle.com/en/operating-systems/oracle-linux/8/drgn/how_to_install_drgn.html>`_
+  for more information.
+
 * Arch Linux
 
-  Install the `drgn <https://aur.archlinux.org/packages/drgn/>`_ package from
-  the `AUR <https://wiki.archlinux.org/title/Arch_User_Repository>`_.
+  .. code-block:: console
+
+      $ sudo pacman -S drgn
 
 * Debian >= 12 (Bookworm)
 
   .. code-block:: console
 
     $ sudo apt install python3-drgn
+
+* Gentoo
+
+  .. code-block:: console
+
+      $ sudo emerge dev-debug/drgn
 
 * openSUSE
 
@@ -101,8 +127,12 @@ drgn can be installed using the package manager on some Linux distributions.
 
 * Ubuntu
 
-  Enable the `michel-slm/kernel-utils PPA <https://launchpad.net/~michel-slm/+archive/ubuntu/kernel-utils>`_.
-  Then:
+  All supported Ubuntu releases except for 22.04 (jammy) ships with drgn - but generally the version that
+  was in Debian unstable at the time that Ubuntu release is branched.
+
+  To get the latest version, including on jammy, enable the `michel-slm/kernel-utils PPA <https://launchpad.net/~michel-slm/+archive/ubuntu/kernel-utils>`_.
+
+  To install drgn itself, with or without the PPA:
 
   .. code-block:: console
 
@@ -140,25 +170,32 @@ First, install dependencies:
 
   .. code-block:: console
 
-      $ sudo dnf install autoconf automake elfutils-devel gcc git libkdumpfile-devel libtool make pkgconf python3 python3-devel python3-pip python3-setuptools
+      $ sudo dnf install autoconf automake check-devel elfutils-devel gcc git libkdumpfile-devel libtool make pkgconf python3 python3-devel python3-pip python3-setuptools
 
-* RHEL/CentOS
+* RHEL/CentOS/Oracle Linux
 
   .. code-block:: console
 
-      $ sudo dnf install autoconf automake elfutils-devel gcc git libtool make pkgconf python3 python3-devel python3-pip python3-setuptools
+      $ sudo dnf install autoconf automake check-devel elfutils-devel gcc git libtool make pkgconf python3 python3-devel python3-pip python3-setuptools
 
   Optionally, install ``libkdumpfile-devel`` from EPEL on RHEL/CentOS >= 8 or
   install `libkdumpfile <https://github.com/ptesarik/libkdumpfile>`_ from
-  source if you want support for the makedumpfile format.
+  source if you want support for the makedumpfile format. For Oracle Linux >= 7,
+  ``libkdumpfile-devel`` can be installed directly from the corresponding addons
+  repository (e.g. ``ol9_addons``).
 
-  Replace ``dnf`` with ``yum`` for RHEL/CentOS < 8.
+  Replace ``dnf`` with ``yum`` for RHEL/CentOS/Oracle Linux < 8.
+
+  When building on RHEL/CentOS/Oracle Linux < 8, you may need to use a newer
+  version of GCC, for example, using the ``devtoolset-12`` developer toolset.
+  Check your distribution's documentation for information on installing and
+  using these newer toolchains.
 
 * Debian/Ubuntu
 
   .. code-block:: console
 
-      $ sudo apt-get install autoconf automake gcc git liblzma-dev libelf-dev libdw-dev libtool make pkgconf python3 python3-dev python3-pip python3-setuptools zlib1g-dev
+      $ sudo apt install autoconf automake check gcc git liblzma-dev libelf-dev libdw-dev libtool make pkgconf python3 python3-dev python3-pip python3-setuptools zlib1g-dev
 
   Optionally, install libkdumpfile from source if you want support for the
   makedumpfile format.
@@ -167,17 +204,19 @@ First, install dependencies:
 
   .. code-block:: console
 
-      $ sudo pacman -S --needed autoconf automake gcc git libelf libtool make pkgconf python python-pip python-setuptools
+      $ sudo pacman -S --needed autoconf automake check gcc git libelf libkdumpfile libtool make pkgconf python python-pip python-setuptools
 
-  Optionally, install `libkdumpfile
-  <https://aur.archlinux.org/packages/libkdumpfile/>`__ from the AUR or from
-  source if you want support for the makedumpfile format.
+* Gentoo
+
+  .. code-block:: console
+
+      $ sudo emerge --noreplace --oneshot dev-build/autoconf dev-build/automake dev-libs/check dev-libs/elfutils sys-devel/gcc dev-vcs/git dev-libs/libkdumpfile dev-build/libtool dev-build/make dev-python/pip virtual/pkgconfig dev-lang/python dev-python/setuptools
 
 * openSUSE
 
   .. code-block:: console
 
-      $ sudo zypper install autoconf automake gcc git libdw-devel libelf-devel libkdumpfile-devel libtool make pkgconf python3 python3-devel python3-pip python3-setuptools
+      $ sudo zypper install autoconf automake check-devel gcc git libdw-devel libelf-devel libkdumpfile-devel libtool make pkgconf python3 python3-devel python3-pip python3-setuptools
 
 Then, run:
 
@@ -242,14 +281,22 @@ variables with ``trace['name']``:
 See the `user guide <https://drgn.readthedocs.io/en/latest/user_guide.html>`_
 for more details and features.
 
+.. start-for-index
+
+Getting Help
+------------
+
+* The `GitHub issue tracker <https://github.com/osandov/drgn/issues>`_ is the
+  preferred method to report issues.
+* There is also a `Linux Kernel Debuggers Matrix room
+  <https://matrix.to/#/#linux-debuggers:matrix.org>`_.
+
 License
 -------
-
-.. start-license
 
 Copyright (c) Meta Platforms, Inc. and affiliates.
 
 drgn is licensed under the `LGPLv2.1
 <https://www.gnu.org/licenses/old-licenses/lgpl-2.1.en.html>`_ or later.
 
-.. end-license
+.. end-for-index

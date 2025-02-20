@@ -39,10 +39,16 @@ class _FormatVisitor(NodeVisitor):
         self._parts: List[str] = []
 
     def visit(  # type: ignore[override]  # This is intentionally incompatible with the supertype.
-        self, node: ast.AST, rst: bool, qualify_typing: bool
+        self,
+        node: ast.AST,
+        *,
+        rst: bool,
+        qualify_typing: bool,
+        qualify_typeshed: bool,
     ) -> str:
         self._rst = rst
         self._qualify_typing = qualify_typing
+        self._qualify_typeshed = qualify_typeshed
         super().visit(node)
         ret = "".join(self._parts)
         self._parts.clear()
@@ -97,6 +103,8 @@ class _FormatVisitor(NodeVisitor):
         title = target
         if not self._qualify_typing and title.startswith("typing."):
             title = title[len("typing.") :]
+        elif not self._qualify_typeshed and title.startswith("_typeshed."):
+            title = title[len("_typeshed.") :]
         elif self._context_module and title.startswith(self._context_module + "."):
             title = title[len(self._context_module) + 1 :]
             if self._context_class and title.startswith(self._context_class + "."):
@@ -124,7 +132,7 @@ class _FormatVisitor(NodeVisitor):
         while True:
             value = node.value
             if isinstance(value, ast.Attribute):
-                name_stack.append(node.attr)
+                name_stack.append(value.attr)
                 node = value
                 continue
             elif isinstance(value, ast.Name):
@@ -272,45 +280,86 @@ class Formatter:
         need_blank_line = bool(lines)
 
         def visit_arg(
-            arg: ast.arg, default: Optional[ast.expr] = None, prefix: str = ""
+            arg: ast.arg, default: Optional[ast.expr] = None, name: Optional[str] = None
         ) -> None:
             nonlocal need_comma, need_blank_line
             if need_comma:
                 signature.append(", ")
-            if prefix:
-                signature.append(prefix)
-            signature.append(arg.arg)
+            signature.append(arg.arg if name is None else name)
 
             default_sep = "="
             if arg.annotation:
                 signature.append(": ")
-                signature.append(visitor.visit(arg.annotation, False, rst))
+                signature.append(
+                    visitor.visit(
+                        arg.annotation,
+                        rst=False,
+                        qualify_typing=rst,
+                        qualify_typeshed=False,
+                    )
+                )
                 default_sep = " = "
 
             if default:
                 signature.append(default_sep)
-                signature.append(visitor.visit(default, False, True))
+                signature.append(
+                    visitor.visit(
+                        default, rst=False, qualify_typing=True, qualify_typeshed=True
+                    )
+                )
             need_comma = True
 
-        posonlyargs = getattr(node.args, "posonlyargs", [])
-        num_posargs = len(posonlyargs) + len(node.args.args)
-        for i, arg in enumerate(posonlyargs + node.args.args):
+        try:
+            posargs = node.args.posonlyargs + node.args.args
+            num_posonlyargs = len(node.args.posonlyargs)
+        except AttributeError:
+            posargs = node.args.args
+            num_posonlyargs = 0
+
+        # Type checkers treat parameters with names that begin but don't end
+        # with __ as positional-only:
+        # https://typing.readthedocs.io/en/latest/spec/historical.html#positional-only-parameters
+        # We translate those to the PEP 570 syntax.
+        def _is_posonly(arg: ast.arg) -> bool:
+            return arg.arg.startswith("__") and not arg.arg.endswith("__")
+
+        num_pep_570_posonlyargs = num_posonlyargs
+        if (
+            num_posonlyargs == 0
+            and classes
+            and not node.has_decorator("staticmethod")
+            and len(posargs) > 1
+            and _is_posonly(posargs[1])
+        ):
+            num_posonlyargs = 2
+        while num_posonlyargs < len(posargs) and _is_posonly(posargs[num_posonlyargs]):
+            num_posonlyargs += 1
+
+        for i, arg in enumerate(posargs):
             default: Optional[ast.expr]
-            if i >= num_posargs - len(node.args.defaults):
+            if i >= len(posargs) - len(node.args.defaults):
                 default = node.args.defaults[
-                    i - (num_posargs - len(node.args.defaults))
+                    i - (len(posargs) - len(node.args.defaults))
                 ]
             else:
                 default = None
             if i == 0 and classes and not node.has_decorator("staticmethod"):
                 # Skip self for methods and cls for class methods.
                 continue
-            visit_arg(arg, default)
-            if i == len(posonlyargs) - 1:
+            visit_arg(
+                arg,
+                default,
+                name=(
+                    arg.arg[2:]
+                    if num_pep_570_posonlyargs <= i < num_posonlyargs
+                    else arg.arg
+                ),
+            )
+            if i == num_posonlyargs - 1:
                 signature.append(", /")
 
         if node.args.vararg:
-            visit_arg(node.args.vararg, prefix="*")
+            visit_arg(node.args.vararg, name="*" + node.args.vararg.arg)
 
         if node.args.kwonlyargs:
             if not node.args.vararg:
@@ -322,13 +371,17 @@ class Formatter:
                 visit_arg(arg, node.args.kw_defaults[i])
 
         if node.args.kwarg:
-            visit_arg(node.args.kwarg, prefix="**")
+            visit_arg(node.args.kwarg, name="**" + node.args.kwarg.arg)
 
         signature.append(")")
 
         if want_rtype and node.returns:
             signature.append(" -> ")
-            signature.append(visitor.visit(node.returns, False, rst))
+            signature.append(
+                visitor.visit(
+                    node.returns, rst=False, qualify_typing=rst, qualify_typeshed=False
+                )
+            )
 
         return "".join(signature), lines
 
@@ -342,36 +395,7 @@ class Formatter:
     ) -> List[str]:
         node = resolved.node
 
-        lines = []
-
-        if rst:
-            lines.append(f".. py:class:: {name}")
-
-        if node.bases:
-            visitor = _FormatVisitor(
-                self._namespace,
-                self._substitutions,
-                resolved.modules,
-                resolved.classes,
-                context_module,
-                context_class,
-            )
-            bases = [visitor.visit(base, rst, False) for base in node.bases]
-            if lines:
-                lines.append("")
-            lines.append(("    " if rst else "") + "Bases: " + ", ".join(bases))
-
-        if node.docstring:
-            docstring_lines = node.docstring.splitlines()
-            if lines:
-                lines.append("")
-            if rst:
-                for line in docstring_lines:
-                    lines.append("    " + line)
-            else:
-                lines.extend(docstring_lines)
-
-        init_signatures: Sequence[FunctionSignature] = ()
+        init_signatures: List[FunctionSignature] = []
         try:
             init = resolved.attr("__init__")
         except KeyError:
@@ -387,6 +411,56 @@ class Formatter:
                 init_context_class = resolved.name
                 if context_class:
                     init_context_class = context_class + "." + init_context_class
+
+        lines = []
+
+        if rst and len(init_signatures) == 1 and node.docstring is None:
+            class_signature, class_docstring_lines = self._format_function_signature(
+                init_signatures[0],
+                init.modules,
+                init.classes,
+                context_module,
+                init_context_class,
+                rst,
+                False,
+            )
+            del init_signatures[0]
+        else:
+            class_signature = ""
+            class_docstring_lines = (
+                node.docstring.splitlines() if node.docstring else []
+            )
+
+        if rst:
+            lines.append(f".. py:class:: {name}{class_signature}")
+
+        if node.bases:
+            visitor = _FormatVisitor(
+                self._namespace,
+                self._substitutions,
+                resolved.modules,
+                resolved.classes,
+                context_module,
+                context_class,
+            )
+            bases = [
+                visitor.visit(
+                    base, rst=rst, qualify_typing=False, qualify_typeshed=False
+                )
+                for base in node.bases
+            ]
+            if lines:
+                lines.append("")
+            lines.append(("    " if rst else "") + "Bases: " + ", ".join(bases))
+
+        if class_docstring_lines:
+            if lines:
+                lines.append("")
+            if rst:
+                for line in class_docstring_lines:
+                    lines.append("    " + line)
+            else:
+                lines.extend(class_docstring_lines)
 
         for i, signature_node in enumerate(init_signatures):
             if lines:
@@ -489,7 +563,13 @@ class Formatter:
             lines = [f".. {directive}:: {name}"]
             if node.annotation:
                 lines.append(
-                    "    :type: " + visitor.visit(node.annotation, False, True)
+                    "    :type: "
+                    + visitor.visit(
+                        node.annotation,
+                        rst=False,
+                        qualify_typing=True,
+                        qualify_typeshed=False,
+                    )
                 )
             if docstring_lines:
                 lines.append("")
@@ -500,7 +580,15 @@ class Formatter:
             if node.annotation:
                 if docstring_lines:
                     docstring_lines.insert(0, "")
-                docstring_lines.insert(0, visitor.visit(node.annotation, False, False))
+                docstring_lines.insert(
+                    0,
+                    visitor.visit(
+                        node.annotation,
+                        rst=False,
+                        qualify_typing=False,
+                        qualify_typeshed=False,
+                    ),
+                )
             return docstring_lines
 
     def format(

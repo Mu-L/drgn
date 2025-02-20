@@ -3,17 +3,16 @@
 
 import os
 import os.path
-import subprocess
-import tempfile
-import unittest
 
 from drgn import Program
 from tests import TestCase
+from tests.resources import get_resource
 
 
 class TestLive(TestCase):
     @classmethod
     def setUpClass(cls):
+        super().setUpClass()
         cls.prog = Program()
         cls.prog.set_pid(os.getpid())
 
@@ -36,6 +35,13 @@ class TestLive(TestCase):
             self.prog.crashed_thread,
         )
 
+    def test_thread_name(self):
+        with open(f"/proc/{os.getpid()}/comm", "r") as f:
+            comm = f.read().strip()
+        self.assertEqual(self.prog.main_thread().name, comm)
+        for thread in self.prog.threads():
+            self.assertIsNotNone(thread.name)
+
 
 class TestCoreDump(TestCase):
     TIDS = (
@@ -57,26 +63,13 @@ class TestCoreDump(TestCase):
     MAIN_TID = 2265413
     CRASHED_TID = 2265419
 
+    MAIN_THREAD_NAME = "segfault_random"
+
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        with tempfile.NamedTemporaryFile() as core_dump_file:
-            try:
-                subprocess.check_call(
-                    [
-                        "zstd",
-                        "--quiet",
-                        "--force",
-                        "--decompress",
-                        "--stdout",
-                        os.path.join(os.path.dirname(__file__), "sample.coredump.zst"),
-                    ],
-                    stdout=core_dump_file,
-                )
-            except FileNotFoundError:
-                raise unittest.SkipTest("zstd not found")
-            cls.prog = Program()
-            cls.prog.set_core_dump(core_dump_file.name)
+        cls.prog = Program()
+        cls.prog.set_core_dump(get_resource("multithreaded.core"))
 
     def test_threads(self):
         self.assertSequenceEqual(
@@ -96,3 +89,9 @@ class TestCoreDump(TestCase):
 
     def test_crashed_thread(self):
         self.assertEqual(self.prog.crashed_thread().tid, self.CRASHED_TID)
+
+    def test_thread_name(self):
+        self.assertEqual(self.prog.main_thread().name, self.MAIN_THREAD_NAME)
+        for tid in self.TIDS:
+            if tid != self.MAIN_TID:
+                self.assertIsNone(self.prog.thread(tid).name)

@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest.mock
 
+from _drgn_util.elf import ET, PT
 from drgn import (
     Architecture,
     FaultError,
@@ -35,7 +36,6 @@ from tests import (
     TestCase,
     mock_program,
 )
-from tests.elf import ET, PT
 from tests.elfwriter import ElfSection, create_elf_file
 
 
@@ -161,6 +161,10 @@ class TestProgram(TestCase):
         self.assertRaisesRegex(
             TypeError, "language must be Language", setattr, prog, "language", "CPP"
         )
+
+    def test_language_del(self):
+        with self.assertRaises(AttributeError):
+            del Program().language
 
 
 class TestMemory(TestCase):
@@ -404,14 +408,73 @@ class TestMemory(TestCase):
         )
 
 
-class TestTypes(MockProgramTestCase):
-    def test_invalid_finder(self):
-        self.assertRaises(TypeError, self.prog.add_type_finder, "foo")
+class TestTypeFinder(TestCase):
+    def test_register(self):
+        prog = Program(MOCK_PLATFORM)
 
-        self.prog.add_type_finder(lambda kind, name, filename: "foo")
-        self.assertRaises(TypeError, self.prog.type, "int")
+        # We don't test every corner case because the symbol finder tests cover
+        # the shared part.
+        self.assertEqual(prog.registered_type_finders(), {"dwarf"})
+        self.assertEqual(prog.enabled_type_finders(), ["dwarf"])
 
-    def test_finder_different_program(self):
+        prog.register_type_finder(
+            "foo", lambda prog, kinds, name, filename: None, enable_index=-1
+        )
+        self.assertEqual(prog.registered_type_finders(), {"dwarf", "foo"})
+        self.assertEqual(prog.enabled_type_finders(), ["dwarf", "foo"])
+
+        prog.set_enabled_type_finders(["foo"])
+        self.assertEqual(prog.registered_type_finders(), {"dwarf", "foo"})
+        self.assertEqual(prog.enabled_type_finders(), ["foo"])
+
+    def test_add_type_finder(self):
+        prog = Program(MOCK_PLATFORM)
+
+        def dummy(kind, name, filename):
+            if kind == TypeKind.TYPEDEF and name == "foo":
+                return prog.typedef_type("foo", prog.void_type())
+            else:
+                return None
+
+        prog.add_type_finder(dummy)
+        self.assertTrue(any("dummy" in name for name in prog.registered_type_finders()))
+        self.assertIn("dummy", prog.enabled_type_finders()[0])
+        self.assertIdentical(
+            prog.type("foo"), prog.typedef_type("foo", prog.void_type())
+        )
+
+    def test_register_invalid(self):
+        prog = Program(MOCK_PLATFORM)
+        self.assertRaises(TypeError, prog.register_type_finder, "foo", "foo")
+        prog.register_type_finder(
+            "foo", lambda prog, kinds, name, filename: "foo", enable_index=0
+        )
+        self.assertRaises(TypeError, prog.type, "int")
+
+    def test_add_invalid(self):
+        prog = Program(MOCK_PLATFORM)
+        self.assertRaises(TypeError, prog.add_type_finder, "foo")
+        prog.add_type_finder(lambda kind, name, filename: "foo")
+        self.assertRaises(TypeError, prog.type, "int")
+
+    def test_register_wrong_program(self):
+        def finder(prog, kinds, name, filename):
+            if TypeKind.TYPEDEF in kinds and name == "foo":
+                prog = Program()
+                return prog.typedef_type("foo", prog.void_type())
+            else:
+                return None
+
+        prog = Program(MOCK_PLATFORM)
+        prog.register_type_finder("foo", finder, enable_index=0)
+        self.assertRaisesRegex(
+            ValueError,
+            "type find callback returned type from wrong program",
+            prog.type,
+            "foo",
+        )
+
+    def test_add_wrong_program(self):
         def finder(kind, name, filename):
             if kind == TypeKind.TYPEDEF and name == "foo":
                 prog = Program()
@@ -419,23 +482,113 @@ class TestTypes(MockProgramTestCase):
             else:
                 return None
 
-        self.prog.add_type_finder(finder)
+        prog = Program(MOCK_PLATFORM)
+        prog.add_type_finder(finder)
         self.assertRaisesRegex(
             ValueError,
             "type find callback returned type from wrong program",
-            self.prog.type,
+            prog.type,
             "foo",
         )
 
-    def test_wrong_kind(self):
-        self.prog.add_type_finder(lambda kind, name, filename: self.prog.void_type())
-        self.assertRaises(TypeError, self.prog.type, "int")
+    def test_register_wrong_kind(self):
+        prog = Program(MOCK_PLATFORM)
+        prog.register_type_finder(
+            "foo", lambda prog, kinds, name, filename: prog.void_type(), enable_index=0
+        )
+        self.assertRaises(TypeError, prog.type, "int")
+
+    def test_add_wrong_kind(self):
+        prog = Program(MOCK_PLATFORM)
+        prog.add_type_finder(lambda kind, name, filename: prog.void_type())
+        self.assertRaises(TypeError, prog.type, "int")
+
+    def test_register_not_found(self):
+        prog = Program(MOCK_PLATFORM)
+        prog.register_type_finder(
+            "foo", lambda prog, kinds, name, filename: None, enable_index=0
+        )
+        self.assertRaises(LookupError, prog.type, "struct foo")
+
+    def test_add_not_found(self):
+        prog = Program(MOCK_PLATFORM)
+        prog.add_type_finder(lambda kind, name, filename: None)
+        self.assertRaises(LookupError, prog.type, "struct foo")
+
+
+class TestObjectFinder(TestCase):
+    def test_register(self):
+        prog = Program(MOCK_PLATFORM)
+
+        # We don't test every corner case because the symbol finder tests cover
+        # the shared part.
+        self.assertEqual(prog.registered_object_finders(), {"dwarf"})
+        self.assertEqual(prog.enabled_object_finders(), ["dwarf"])
+
+        prog.register_object_finder(
+            "foo", lambda prog, name, flags, filename: None, enable_index=-1
+        )
+        self.assertEqual(prog.registered_object_finders(), {"dwarf", "foo"})
+        self.assertEqual(prog.enabled_object_finders(), ["dwarf", "foo"])
+
+        prog.set_enabled_object_finders(["foo"])
+        self.assertEqual(prog.registered_object_finders(), {"dwarf", "foo"})
+        self.assertEqual(prog.enabled_object_finders(), ["foo"])
+
+    def test_add_object_finder(self):
+        prog = Program(MOCK_PLATFORM)
+
+        def dummy(prog, name, flags, filename):
+            return Object(prog, "int", 1)
+
+        prog.add_object_finder(dummy)
+        self.assertTrue(
+            any("dummy" in name for name in prog.registered_object_finders())
+        )
+        self.assertIn("dummy", prog.enabled_object_finders()[0])
+        self.assertIdentical(prog.object("foo"), Object(prog, "int", 1))
+
+    def test_register_invalid(self):
+        prog = Program(MOCK_PLATFORM)
+        self.assertRaises(TypeError, prog.register_object_finder, "foo", "foo")
+        prog.register_object_finder(
+            "foo", lambda prog, name, flags, filename: "foo", enable_index=0
+        )
+        self.assertRaises(TypeError, prog.object, "foo")
+
+    def test_add_invalid(self):
+        prog = Program(MOCK_PLATFORM)
+        self.assertRaises(TypeError, prog.add_object_finder, "foo")
+        prog.add_object_finder(lambda prog, name, flags, filename: "foo")
+        self.assertRaises(TypeError, prog.object, "foo")
+
+    def test_wrong_program(self):
+        prog = Program(MOCK_PLATFORM)
+        prog.register_object_finder(
+            "foo",
+            lambda prog, name, flags, filename: Object(
+                Program(MOCK_PLATFORM), "int", 1
+            ),
+            enable_index=0,
+        )
+        self.assertRaisesRegex(
+            ValueError,
+            "different program",
+            prog.object,
+            "foo",
+        )
 
     def test_not_found(self):
-        self.assertRaises(LookupError, self.prog.type, "struct foo")
-        self.prog.add_type_finder(lambda kind, name, filename: None)
-        self.assertRaises(LookupError, self.prog.type, "struct foo")
+        prog = Program(MOCK_PLATFORM)
+        self.assertRaises(LookupError, prog.object, "foo")
+        prog.register_object_finder(
+            "foo", lambda prog, name, flags, filename: None, enable_index=0
+        )
+        self.assertRaises(LookupError, prog.object, "foo")
+        self.assertFalse("foo" in prog)
 
+
+class TestTypes(MockProgramTestCase):
     def test_already_type(self):
         self.assertIdentical(
             self.prog.type(self.prog.pointer_type(self.prog.void_type())),
@@ -778,18 +931,6 @@ class TestTypes(MockProgramTestCase):
 
 
 class TestObjects(MockProgramTestCase):
-    def test_invalid_finder(self):
-        self.assertRaises(TypeError, self.prog.add_object_finder, "foo")
-
-        self.prog.add_object_finder(lambda prog, name, flags, filename: "foo")
-        self.assertRaises(TypeError, self.prog.object, "foo")
-
-    def test_not_found(self):
-        self.assertRaises(LookupError, self.prog.object, "foo")
-        self.prog.add_object_finder(lambda prog, name, flags, filename: None)
-        self.assertRaises(LookupError, self.prog.object, "foo")
-        self.assertFalse("foo" in self.prog)
-
     def test_constant(self):
         self.objects.append(
             MockObject("PAGE_SIZE", self.prog.int_type("int", 4, True), value=4096)
@@ -922,3 +1063,93 @@ class TestCoreDump(TestCase):
         with self.assertRaisesRegex(FaultError, "memory not saved in core dump") as cm:
             prog.read(0xFFFF0000, len(data) + 4)
         self.assertEqual(cm.exception.address, 0xFFFF000C)
+
+
+def dummy_symbol_finder(prog, name, address, one):
+    return ()
+
+
+class TestSymbolFinders(TestCase):
+    def test_registered(self):
+        prog = Program()
+        self.assertEqual(prog.registered_symbol_finders(), {"elf"})
+        prog.register_symbol_finder("foo", dummy_symbol_finder)
+        self.assertEqual(prog.registered_symbol_finders(), {"elf", "foo"})
+
+    def test_register_duplicate(self):
+        self.assertRaisesRegex(
+            ValueError,
+            "duplicate symbol finder",
+            Program().register_symbol_finder,
+            "elf",
+            dummy_symbol_finder,
+        )
+
+    def test_default_enabled(self):
+        self.assertEqual(Program().enabled_symbol_finders(), ["elf"])
+
+    def test_disable_all(self):
+        prog = Program()
+        prog.set_enabled_symbol_finders(())
+        self.assertEqual(prog.enabled_symbol_finders(), [])
+
+    def test_register_then_enable(self):
+        prog = Program()
+        prog.register_symbol_finder("foo", dummy_symbol_finder)
+        self.assertEqual(prog.enabled_symbol_finders(), ["elf"])
+
+        prog.set_enabled_symbol_finders(["foo", "elf"])
+        self.assertEqual(prog.enabled_symbol_finders(), ["foo", "elf"])
+
+    def test_register_enable_index(self):
+        prog = Program()
+        with self.subTest("None"):
+            prog.register_symbol_finder("ghost", dummy_symbol_finder, enable_index=None)
+            self.assertEqual(prog.enabled_symbol_finders(), ["elf"])
+
+        with self.subTest("first"):
+            prog.register_symbol_finder("foo", dummy_symbol_finder, enable_index=0)
+            self.assertEqual(prog.enabled_symbol_finders(), ["foo", "elf"])
+
+        with self.subTest("middle"):
+            prog.register_symbol_finder("bar", dummy_symbol_finder, enable_index=1)
+            self.assertEqual(prog.enabled_symbol_finders(), ["foo", "bar", "elf"])
+
+        with self.subTest("end"):
+            prog.register_symbol_finder("baz", dummy_symbol_finder, enable_index=3)
+            self.assertEqual(
+                prog.enabled_symbol_finders(), ["foo", "bar", "elf", "baz"]
+            )
+
+        with self.subTest("past end"):
+            prog.register_symbol_finder("qux", dummy_symbol_finder, enable_index=10)
+            self.assertEqual(
+                prog.enabled_symbol_finders(), ["foo", "bar", "elf", "baz", "qux"]
+            )
+
+        with self.subTest("DRGN_HANDLER_REGISTER_DONT_ENABLE"):
+            prog.register_symbol_finder(
+                "quux",
+                dummy_symbol_finder,
+                enable_index=(2**64 if sys.maxsize > 2**32 else 2**32) - 2,
+            )
+            self.assertEqual(
+                prog.enabled_symbol_finders(),
+                ["foo", "bar", "elf", "baz", "qux", "quux"],
+            )
+
+        with self.subTest("last"):
+            prog.register_symbol_finder("quuux", dummy_symbol_finder, enable_index=-1)
+            self.assertEqual(
+                prog.enabled_symbol_finders(),
+                ["foo", "bar", "elf", "baz", "qux", "quux", "quuux"],
+            )
+
+    def test_register_enable_index_invalid(self):
+        self.assertRaises(
+            OverflowError,
+            Program().register_symbol_finder,
+            "foo",
+            dummy_symbol_finder,
+            enable_index=-2,
+        )

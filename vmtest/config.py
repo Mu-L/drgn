@@ -8,11 +8,17 @@ import os
 from pathlib import Path
 from typing import Dict, Mapping, NamedTuple, Sequence
 
-from util import NORMALIZED_MACHINE_NAME
+from _drgn_util.platform import NORMALIZED_MACHINE_NAME
 
 # Kernel versions that we run tests on and therefore support. Keep this in sync
 # with docs/support_matrix.rst.
 SUPPORTED_KERNEL_VERSIONS = (
+    "6.14",
+    "6.13",
+    "6.12",
+    "6.11",
+    "6.10",
+    "6.9",
     "6.8",
     "6.7",
     "6.6",
@@ -39,7 +45,6 @@ SUPPORTED_KERNEL_VERSIONS = (
 )
 
 KERNEL_ORG_COMPILER_VERSION = "12.2.0"
-VMTEST_KERNEL_VERSION = 28
 
 
 BASE_KCONFIG = """
@@ -100,6 +105,9 @@ CONFIG_CRYPTO_SHA256=y
 # So that we can trigger a crash with /proc/sysrq-trigger.
 CONFIG_MAGIC_SYSRQ=y
 
+# For testing kernel core dumps from QEMU's dump-guest-memory command.
+CONFIG_FW_CFG_SYSFS=y
+
 # For BPF tests.
 CONFIG_BPF_SYSCALL=y
 CONFIG_BPF_JIT=y
@@ -121,6 +129,8 @@ CONFIG_IKCONFIG_PROC=y
 
 # For filesystem tests.
 CONFIG_BTRFS_FS=m
+# Don't waste time benchmarking in raid6_pq just to load the Btrfs module.
+CONFIG_RAID6_PQ_BENCHMARK=n
 CONFIG_EXT4_FS=m
 CONFIG_XFS_FS=m
 
@@ -189,7 +199,7 @@ KERNEL_FLAVORS = OrderedDict(
         ),
         KernelFlavor(
             name="alternative",
-            description="SLAB allocator, no KASLR",
+            description="SLAB allocator, module versioning, no KASLR",
             config="""
                 CONFIG_SMP=y
                 CONFIG_SLAB=y
@@ -197,6 +207,7 @@ KERNEL_FLAVORS = OrderedDict(
                 # CONFIG_SLAB to CONFIG_SLAB_DEPRECATED") (in v6.5) renamed the
                 # option for SLAB.
                 CONFIG_SLAB_DEPRECATED=y
+                CONFIG_MODVERSIONS=y
                 CONFIG_RANDOMIZE_BASE=n
             """,
         ),
@@ -226,7 +237,7 @@ KERNEL_FLAVORS = OrderedDict(
 
 class Architecture(NamedTuple):
     # Architecture name. This matches the names used by
-    # util.NORMALIZED_MACHINE_NAME and qemu-system-$arch_name.
+    # _drgn_util.platform.NORMALIZED_MACHINE_NAME and qemu-system-$arch_name.
     name: str
     # Value of ARCH variable to build the Linux kernel.
     kernel_arch: str
@@ -265,12 +276,9 @@ ARCHITECTURES = {
             kernel_flavor_configs={
                 "default": """
                     CONFIG_ARM64_4K_PAGES=y
-                    CONFIG_ARM64_VA_BITS_48=y
                 """,
                 "alternative": """
                     CONFIG_ARM64_64K_PAGES=y
-                    CONFIG_ARM64_VA_BITS_52=y
-                    CONFIG_ARM64_PA_BITS_52=y
                 """,
                 "tiny": """
                     CONFIG_ARM64_16K_PAGES=y
@@ -287,8 +295,6 @@ ARCHITECTURES = {
             debian_arch="armhf",
             kernel_config="""
                 CONFIG_NR_CPUS=8
-                CONFIG_HIGHMEM=y
-                CONFIG_ARM_LPAE=n
                 # Debian armhf userspace assumes EABI and VFP.
                 CONFIG_AEABI=y
                 CONFIG_VFP=y
@@ -306,8 +312,20 @@ ARCHITECTURES = {
                 CONFIG_STACKPROTECTOR_PER_TASK=n
             """,
             kernel_flavor_configs={
+                "default": """
+                    CONFIG_VMSPLIT_2G=y
+                    CONFIG_HIGHMEM=n
+                    CONFIG_ARM_LPAE=n
+                """,
                 "alternative": """
+                    CONFIG_VMSPLIT_2G=y
+                    CONFIG_HIGHMEM=n
                     CONFIG_ARM_LPAE=y
+                """,
+                "tiny": """
+                    CONFIG_VMSPLIT_3G=y
+                    CONFIG_HIGHMEM=y
+                    CONFIG_ARM_LPAE=n
                 """,
             },
             kernel_org_compiler_name="arm-linux-gnueabi",
@@ -405,12 +423,21 @@ class Compiler(NamedTuple):
         }
 
 
-def kconfig_localversion(flavor: KernelFlavor) -> str:
-    localversion = f"-vmtest{VMTEST_KERNEL_VERSION}"
-    # The default flavor should be the "latest" version.
-    localversion += ".1" if flavor.name == "default" else ".0"
-    localversion += flavor.name
-    return localversion
+def kconfig_localversion(arch: Architecture, flavor: KernelFlavor, version: str) -> str:
+    vmtest_kernel_version = [
+        # Increment the major version to rebuild every
+        # architecture/flavor/version combination.
+        34,
+        # The minor version makes the default flavor the "latest" version.
+        1 if flavor.name == "default" else 0,
+    ]
+    patch_level = 0
+    # If only specific architecture/flavor/version combinations need to be
+    # rebuilt, conditionally increment the patch level here.
+    if patch_level:
+        vmtest_kernel_version.append(patch_level)
+
+    return "-vmtest" + ".".join(str(n) for n in vmtest_kernel_version) + flavor.name
 
 
 def kconfig(arch: Architecture, flavor: KernelFlavor) -> str:

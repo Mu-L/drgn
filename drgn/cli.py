@@ -6,19 +6,18 @@
 
 import argparse
 import builtins
-import code
 import importlib
 import logging
 import os
 import os.path
 import pkgutil
-import readline
 import runpy
 import shutil
 import sys
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import drgn
+from drgn.internal.repl import interact, readline
 from drgn.internal.rlcompleter import Completer
 from drgn.internal.sudohelper import open_via_sudo
 
@@ -90,19 +89,6 @@ def version_header() -> str:
     return f"drgn {drgn.__version__} (using Python {python_version}, elfutils {drgn._elfutils_version}, {libkdumpfile})"
 
 
-class _QuietAction(argparse.Action):
-    def __init__(
-        self, option_strings: Any, dest: Any, nargs: Any = 0, **kwds: Any
-    ) -> None:
-        super().__init__(option_strings, dest, nargs=nargs, **kwds)
-
-    def __call__(
-        self, parser: Any, namespace: Any, values: Any, option_string: Any = None
-    ) -> None:
-        setattr(namespace, self.dest, True)
-        namespace.log_level = "none"
-
-
 def _identify_script(path: str) -> str:
     EI_NIDENT = 16
     SIZEOF_E_TYPE = 2
@@ -138,7 +124,11 @@ def _displayhook(value: Any) -> None:
         return
     setattr(builtins, "_", None)
     if isinstance(value, drgn.Object):
-        text = value.format_(columns=shutil.get_terminal_size((0, 0)).columns)
+        try:
+            text = value.format_(columns=shutil.get_terminal_size((0, 0)).columns)
+        except drgn.FaultError as e:
+            logger.warning("can't print value: %s", e)
+            text = repr(value)
     elif isinstance(value, (drgn.StackFrame, drgn.StackTrace, drgn.Type)):
         text = str(value)
     else:
@@ -156,11 +146,68 @@ def _displayhook(value: Any) -> None:
     setattr(builtins, "_", value)
 
 
+class _DebugInfoOptionAction(argparse.Action):
+    _choices: Dict[str, Tuple[str, Any]]
+
+    @staticmethod
+    def _bool_options(value: bool) -> Dict[str, Tuple[str, bool]]:
+        return {
+            option: ("try_" + option.replace("-", "_"), value)
+            for option in (
+                "module-name",
+                "build-id",
+                "debug-link",
+                "procfs",
+                "embedded-vdso",
+                "reuse",
+                "supplementary",
+            )
+        }
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: Any,
+        option_string: Optional[str] = None,
+    ) -> None:
+        dest = getattr(namespace, self.dest, None)
+        if dest is None:
+            dest = {}
+            setattr(namespace, self.dest, dest)
+
+        for option in values.split(","):
+            try:
+                name, value = self._choices[option]
+            except KeyError:
+                raise argparse.ArgumentError(
+                    self,
+                    f"invalid option: {option!r} (choose from {', '.join(self._choices)})",
+                )
+            dest[name] = value
+
+
+class _TryDebugInfoOptionAction(_DebugInfoOptionAction):
+    _choices = {
+        **_DebugInfoOptionAction._bool_options(True),
+        "kmod=depmod": ("try_kmod", drgn.KmodSearchMethod.DEPMOD),
+        "kmod=walk": ("try_kmod", drgn.KmodSearchMethod.WALK),
+        "kmod=depmod-or-walk": ("try_kmod", drgn.KmodSearchMethod.DEPMOD_OR_WALK),
+        "kmod=depmod-and-walk": ("try_kmod", drgn.KmodSearchMethod.DEPMOD_AND_WALK),
+    }
+
+
+class _NoDebugInfoOptionAction(_DebugInfoOptionAction):
+    _choices = {
+        **_DebugInfoOptionAction._bool_options(False),
+        "kmod": ("try_kmod", drgn.KmodSearchMethod.NONE),
+    }
+
+
 def _main() -> None:
     handler = logging.StreamHandler()
-    handler.setFormatter(
-        _LogFormatter(hasattr(sys.stderr, "fileno") and os.isatty(sys.stderr.fileno()))
-    )
+    color = hasattr(sys.stderr, "fileno") and os.isatty(sys.stderr.fileno())
+    handler.setFormatter(_LogFormatter(color))
     logging.getLogger().addHandler(handler)
 
     version = version_header()
@@ -190,7 +237,9 @@ def _main() -> None:
         metavar="PATH",
         type=str,
         action="append",
-        help="load additional debugging symbols from the given file; this option may be given more than once",
+        help="load debugging symbols from the given file. "
+        "If the file does not correspond to a loaded executable, library, or module, "
+        "then it is ignored. This option may be given more than once",
     )
     default_symbols_group = symbol_group.add_mutually_exclusive_group()
     default_symbols_group.add_argument(
@@ -198,17 +247,87 @@ def _main() -> None:
         dest="default_symbols",
         action="store_const",
         const={"main": True},
-        help="only load debugging symbols for the main executable and those added with -s; "
-        "for userspace programs, this is currently equivalent to --no-default-symbols",
+        help="only load debugging symbols for the main executable "
+        "and those added with -s or --extra-symbols",
     )
     default_symbols_group.add_argument(
         "--no-default-symbols",
         dest="default_symbols",
         action="store_const",
         const={},
-        help="don't load any debugging symbols that were not explicitly added with -s",
+        help="don't load any debugging symbols that were not explicitly added "
+        "with -s or --extra-symbols",
+    )
+    symbol_group.add_argument(
+        "--extra-symbols",
+        metavar="PATH",
+        type=str,
+        action="append",
+        help="load additional debugging symbols from the given file, "
+        "which is assumed not to correspond to a loaded executable, library, or module. "
+        "This option may be given more than once",
+    )
+    symbol_group.add_argument(
+        "--try-symbols-by",
+        dest="symbols_by",
+        metavar="METHOD[,METHOD...]",
+        action=_TryDebugInfoOptionAction,
+        help="enable loading debugging symbols using the given methods. "
+        "Choices are " + ", ".join(_TryDebugInfoOptionAction._choices) + ". "
+        "This option may be given more than once",
+    )
+    symbol_group.add_argument(
+        "--no-symbols-by",
+        dest="symbols_by",
+        metavar="METHOD[,METHOD...]",
+        action=_NoDebugInfoOptionAction,
+        help="disable loading debugging symbols using the given methods. "
+        "Choices are " + ", ".join(_NoDebugInfoOptionAction._choices) + ". "
+        "This option may be given more than once",
+    )
+    symbol_group.add_argument(
+        "--debug-directory",
+        dest="debug_directories",
+        metavar="PATH",
+        type=str,
+        action="append",
+        help="search for debugging symbols by build ID and debug link in the given directory. "
+        "This option may be given more than once",
+    )
+    symbol_group.add_argument(
+        "--no-default-debug-directories",
+        action="store_true",
+        help="don't search for debugging symbols by build ID and debug link in the standard locations",
+    )
+    symbol_group.add_argument(
+        "--kernel-directory",
+        dest="kernel_directories",
+        metavar="PATH",
+        type=str,
+        action="append",
+        help="search for the kernel image and loadable kernel modules in the given directory. "
+        "This option may be given more than once",
+    )
+    symbol_group.add_argument(
+        "--no-default-kernel-directories",
+        action="store_true",
+        help="don't search for the kernel image and loadable kernel modules in the standard locations",
     )
 
+    advanced_group = parser.add_argument_group("advanced")
+    advanced_group.add_argument(
+        "--architecture",
+        metavar="ARCH",
+        choices=[a.name for a in drgn.Architecture]
+        + [a.name.lower() for a in drgn.Architecture],
+        help="set the program architecture, in case it can't be auto-detected",
+    )
+    advanced_group.add_argument(
+        "--vmcoreinfo",
+        type=str,
+        metavar="PATH",
+        help="path to vmcoreinfo file (overrides any already present in the file)",
+    )
     parser.add_argument(
         "--log-level",
         choices=["debug", "info", "warning", "error", "critical", "none"],
@@ -218,7 +337,9 @@ def _main() -> None:
     parser.add_argument(
         "-q",
         "--quiet",
-        action=_QuietAction,
+        dest="log_level",
+        action="store_const",
+        const="none",
         help="don't print any logs or download progress",
     )
     parser.add_argument(
@@ -251,14 +372,21 @@ def _main() -> None:
     else:
         print(version, file=sys.stderr, flush=True)
 
-    if not args.quiet:
-        os.environ["DEBUGINFOD_PROGRESS"] = "1"
     if args.log_level == "none":
         logger.setLevel(logging.CRITICAL + 1)
     else:
         logger.setLevel(args.log_level.upper())
 
-    prog = drgn.Program()
+    platform = None
+    if args.architecture:
+        platform = drgn.Platform(drgn.Architecture[args.architecture.upper()])
+
+    vmcoreinfo = None
+    if args.vmcoreinfo is not None:
+        with open(args.vmcoreinfo, "rb") as f:
+            vmcoreinfo = f.read()
+
+    prog = drgn.Program(platform=platform, vmcoreinfo=vmcoreinfo)
     try:
         if args.core is not None:
             prog.set_core_dump(args.core)
@@ -285,12 +413,44 @@ def _main() -> None:
         # E.g., "not an ELF core file"
         sys.exit(f"error: {e}")
 
+    if args.symbols_by:
+        for option, value in args.symbols_by.items():
+            setattr(prog.debug_info_options, option, value)
+
+    if args.debug_directories is not None:
+        if args.no_default_debug_directories:
+            prog.debug_info_options.directories = args.debug_directories
+        else:
+            prog.debug_info_options.directories = (
+                tuple(args.debug_directories) + prog.debug_info_options.directories
+            )
+    elif args.no_default_debug_directories:
+        prog.debug_info_options.directories = ()
+
+    if args.kernel_directories is not None:
+        if args.no_default_kernel_directories:
+            prog.debug_info_options.kernel_directories = args.kernel_directories
+        else:
+            prog.debug_info_options.kernel_directories = (
+                tuple(args.kernel_directories)
+                + prog.debug_info_options.kernel_directories
+            )
+    elif args.no_default_kernel_directories:
+        prog.debug_info_options.kernel_directories = ()
+
     if args.default_symbols is None:
         args.default_symbols = {"default": True, "main": True}
     try:
         prog.load_debug_info(args.symbols, **args.default_symbols)
     except drgn.MissingDebugInfoError as e:
-        logger.warning("%s", e)
+        logger.warning("\033[1m%s\033[m" if color else "%s", e)
+
+    if args.extra_symbols:
+        for extra_symbol_path in args.extra_symbols:
+            extra_symbol_path = os.path.abspath(extra_symbol_path)
+            module, new = prog.extra_module(extra_symbol_path, create=True)
+            if new:
+                module.try_file(extra_symbol_path)
 
     if args.script:
         sys.argv = args.script
@@ -348,9 +508,11 @@ def run_interactive(
         "FaultError",
         "NULL",
         "Object",
+        "alignof",
         "cast",
         "container_of",
         "execscript",
+        "implicit_convert",
         "offsetof",
         "reinterpret",
         "sizeof",
@@ -406,7 +568,7 @@ For help, type help(drgn).
         drgn.set_default_prog(prog)
 
         try:
-            code.interact(banner=banner, exitmsg="", local=init_globals)
+            interact(init_globals, banner)
         finally:
             try:
                 readline.write_history_file(histfile)

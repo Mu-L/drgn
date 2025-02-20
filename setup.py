@@ -9,8 +9,10 @@ import os.path
 from pathlib import Path
 import re
 import shlex
+import shutil
 import subprocess
 import sys
+import sysconfig
 
 from setuptools import Command, find_packages, setup
 from setuptools.command.build_ext import build_ext as _build_ext
@@ -53,6 +55,22 @@ class build_ext(_build_ext):
     boolean_options = ["inplace"]
 
     help_options = []
+
+    def finalize_options(self):
+        default_build_temp = self.build_temp is None
+        super().finalize_options()
+        if default_build_temp and sysconfig.get_config_var("Py_GIL_DISABLED"):
+            # Python 3.13's free-threading builds are not ABI compatible with
+            # the standard ones, but sys.implementation.cache_tag, which
+            # distutils uses to set the default temporary directory, is not
+            # different. This means that the build_temp directory is shared
+            # between these two builds. Since drgn's build_ext allows
+            # incremental builds, this means that build artifacts can be
+            # mistakenly shared between builds, causing runtime errors. To avoid
+            # this, add a "t" suffix for free-threading builds. This isn't
+            # necessary for the build_lib directory, since the final build
+            # product does include the "t" in its filename.
+            self.build_temp += "t"
 
     def _run_autoreconf(self):
         if out_of_date(
@@ -105,7 +123,7 @@ class build_ext(_build_ext):
 
     def run(self):
         self.make()
-        so = os.path.join(self.build_temp, ".libs/_drgn.so")
+        so = os.path.join(self.build_temp, ".libs/libdrgn.so")
         if self.inplace:
             self.copy_file(so, self.get_ext_fullpath("_drgn"))
         old_inplace, self.inplace = self.inplace, 0
@@ -147,6 +165,12 @@ class test(Command):
             f"({', '.join(SUPPORTED_KERNEL_VERSIONS)})",
         ),
         (
+            "flavor=",
+            "f",
+            "when combined with -K, run Linux kernel tests on a specific flavor "
+            f"({', '.join(KERNEL_FLAVORS)}) instead of the default flavor",
+        ),
+        (
             "all-kernel-flavors",
             "F",
             "when combined with -K, run Linux kernel tests on all supported flavors "
@@ -167,6 +191,7 @@ class test(Command):
 
     def initialize_options(self):
         self.kernel = False
+        self.flavor = "default"
         self.all_kernel_flavors = False
         self.extra_kernels = ""
         self.vmtest_dir = None
@@ -174,7 +199,7 @@ class test(Command):
     def finalize_options(self):
         self.kernels = [kernel for kernel in self.extra_kernels.split(",") if kernel]
         if self.kernel:
-            flavors = KERNEL_FLAVORS if self.all_kernel_flavors else [""]
+            flavors = KERNEL_FLAVORS if self.all_kernel_flavors else [self.flavor]
             self.kernels.extend(
                 kernel + ".*" + flavor
                 for kernel in SUPPORTED_KERNEL_VERSIONS
@@ -187,28 +212,27 @@ class test(Command):
     def _run_local(self):
         import unittest
 
+        try:
+            self.get_finalized_command("build_ext").make("check")
+            make_check_success = True
+        except subprocess.CalledProcessError:
+            make_check_success = False
+
         argv = ["discover"]
         if self.verbose:
             argv.append("-v")
         test = unittest.main(module=None, argv=argv, exit=False)
-        return test.result.wasSuccessful()
+        return make_check_success and test.result.wasSuccessful()
 
     def _run_vm(self, kernel):
-        from vmtest.kmod import build_kmod
         import vmtest.vm
 
         logger.info("running tests in VM on Linux %s", kernel.release)
-
-        try:
-            kmod = build_kmod(Path(self.vmtest_dir), kernel)
-        except subprocess.CalledProcessError:
-            return False
 
         command = rf"""
 set -e
 
 export PYTHON={shlex.quote(sys.executable)}
-export DRGN_TEST_KMOD={shlex.quote(str(kmod))}
 if [ -e /proc/vmcore ]; then
     "$PYTHON" -Bm unittest discover -t . -s tests/linux_kernel/vmcore {"-v" if self.verbose else ""}
 else
@@ -222,7 +246,11 @@ fi
 """
         try:
             returncode = vmtest.vm.run_in_vm(
-                command, kernel, Path("/"), Path(self.vmtest_dir)
+                command,
+                kernel,
+                Path("/"),
+                Path(self.vmtest_dir),
+                test_kmod=vmtest.vm.TestKmodMode.BUILD,
             )
         except vmtest.vm.LostVMError:
             logger.exception("error on Linux %s", kernel.release)
@@ -236,15 +264,19 @@ fi
         from vmtest.config import ARCHITECTURES, Kernel, local_kernel
         from vmtest.download import DownloadCompiler, DownloadKernel, download_in_thread
 
-        if os.getenv("GITHUB_ACTIONS") == "true":
+        in_github_actions = os.getenv("GITHUB_ACTIONS") == "true"
+
+        if in_github_actions:
 
             @contextlib.contextmanager
             def github_workflow_group(title):
-                print("::group::" + title, flush=True)
+                sys.stdout.flush()
+                print("::group::" + title, file=sys.stderr, flush=True)
                 try:
                     yield
                 finally:
-                    print("::endgroup::", flush=True)
+                    sys.stdout.flush()
+                    print("::endgroup::", file=sys.stderr, flush=True)
 
         else:
 
@@ -263,7 +295,16 @@ fi
                         to_download.append(
                             DownloadKernel(ARCHITECTURES["x86_64"], pattern)
                         )
-            with download_in_thread(Path(self.vmtest_dir), to_download) as downloads:
+
+            # Downloading too many files before they can be used for testing runs the
+            # risk of filling up the limited disk space is Github Actions. Set a limit
+            # of no more than 5 files which can be downloaded ahead of time. This is a
+            # magic number which is inexact, but works well enough.
+            max_pending_kernels = 5 if in_github_actions else 0
+
+            with download_in_thread(
+                Path(self.vmtest_dir), to_download, max_pending_kernels
+            ) as downloads:
                 downloads_it = iter(downloads)
 
                 if to_download:
@@ -305,6 +346,12 @@ fi
                         logger.info("Passed: %s", ", ".join(passed))
                     if failed:
                         logger.error("Failed: %s", ", ".join(failed))
+
+                    # Github Actions has limited disk space. Once tested, we
+                    # will not use the kernel again, so delete it.
+                    if in_github_actions:
+                        logger.info("Deleting kernel %s", kernel.release)
+                        shutil.rmtree(kernel.path)
         except urllib.error.HTTPError as e:
             if e.code == 403:
                 print(e, file=sys.stderr)
@@ -405,7 +452,7 @@ with open("README.rst", "r") as f:
 setup(
     name="drgn",
     version=get_version(),
-    packages=find_packages(include=["drgn", "drgn.*"]),
+    packages=find_packages(include=["drgn", "drgn.*", "_drgn_util", "_drgn_util.*"]),
     package_data={"drgn": ["../_drgn.pyi", "py.typed"]},
     # This is here so that setuptools knows that we have an extension; it's
     # actually built using autotools/make.
@@ -431,12 +478,13 @@ setup(
     },
     license="LGPL-2.1-or-later",
     classifiers=[
-        "Development Status :: 3 - Alpha",
+        "Development Status :: 5 - Production/Stable",
         "Environment :: Console",
         "Intended Audience :: Developers",
         "License :: OSI Approved :: GNU Lesser General Public License v2 or later (LGPLv2+)",
         "Operating System :: POSIX :: Linux",
         "Programming Language :: Python :: 3",
         "Topic :: Software Development :: Debuggers",
+        "Topic :: System :: Operating System Kernels :: Linux",
     ],
 )

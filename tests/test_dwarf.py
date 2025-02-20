@@ -21,6 +21,7 @@ from drgn import (
     TypeMember,
     TypeParameter,
     TypeTemplateParameter,
+    alignof,
 )
 from tests import (
     DEFAULT_LANGUAGE,
@@ -30,7 +31,17 @@ from tests import (
     identical,
 )
 import tests.assembler as assembler
-from tests.dwarf import DW_AT, DW_ATE, DW_END, DW_FORM, DW_LANG, DW_OP, DW_TAG, DW_UT
+from tests.dwarf import (
+    DW_AT,
+    DW_ATE,
+    DW_END,
+    DW_FORM,
+    DW_INL,
+    DW_LANG,
+    DW_OP,
+    DW_TAG,
+    DW_UT,
+)
 from tests.dwarfwriter import (
     DwarfAttrib,
     DwarfDie,
@@ -191,12 +202,16 @@ labeled_unsigned_int_die = (DwarfLabel("unsigned_int_die"), unsigned_int_die)
 labeled_float_die = (DwarfLabel("float_die"), float_die)
 
 
+def add_extra_dwarf(prog, path):
+    prog.extra_module(path, create=True)[0].try_file(path, force=True)
+
+
 def dwarf_program(*args, segments=None, **kwds):
     prog = Program()
     with tempfile.NamedTemporaryFile() as f:
         f.write(compile_dwarf(*args, **kwds))
         f.flush()
-        prog.load_debug_info([f.name])
+        add_extra_dwarf(prog, f.name)
 
     if segments is not None:
         add_mock_memory_segments(prog, segments)
@@ -4311,6 +4326,35 @@ class TestTypes(TestCase):
             prog.typedef_type("INT", prog.int_type("int", 4, True)),
         )
 
+    def test_alignment(self):
+        prog = dwarf_program(
+            wrap_test_type_dies(
+                DwarfDie(
+                    DW_TAG.structure_type,
+                    (
+                        DwarfAttrib(DW_AT.name, DW_FORM.string, "cacheline"),
+                        DwarfAttrib(DW_AT.byte_size, DW_FORM.data1, 64),
+                        DwarfAttrib(DW_AT.alignment, DW_FORM.data1, 64),
+                    ),
+                    (
+                        DwarfDie(
+                            DW_TAG.member,
+                            (
+                                DwarfAttrib(DW_AT.name, DW_FORM.string, "x"),
+                                DwarfAttrib(
+                                    DW_AT.data_member_location, DW_FORM.data1, 0
+                                ),
+                                DwarfAttrib(DW_AT.alignment, DW_FORM.data1, 64),
+                                DwarfAttrib(DW_AT.type, DW_FORM.ref4, "int_die"),
+                            ),
+                        ),
+                    ),
+                ),
+                *labeled_int_die,
+            )
+        )
+        self.assertEqual(alignof(prog.type("TEST")), 64)
+
 
 class TestObjects(TestCase):
     def test_constant_signed_enum(self):
@@ -4425,7 +4469,10 @@ class TestObjects(TestCase):
                     (
                         DwarfDie(
                             DW_TAG.formal_parameter,
-                            (DwarfAttrib(DW_AT.type, DW_FORM.ref4, "int_die"),),
+                            (
+                                DwarfAttrib(DW_AT.name, DW_FORM.string, "x"),
+                                DwarfAttrib(DW_AT.type, DW_FORM.ref4, "int_die"),
+                            ),
                         ),
                     ),
                 ),
@@ -4437,7 +4484,7 @@ class TestObjects(TestCase):
                 prog,
                 prog.function_type(
                     prog.int_type("int", 4, True),
-                    (TypeParameter(prog.int_type("int", 4, True)),),
+                    (TypeParameter(prog.int_type("int", 4, True), "x"),),
                     False,
                 ),
                 address=0x7FC3EB9B1C30,
@@ -4463,6 +4510,67 @@ class TestObjects(TestCase):
         )
         self.assertIdentical(
             prog.object("abort"), Object(prog, prog.function_type(prog.void_type(), ()))
+        )
+
+    def test_function_concrete_out_of_line_instance(self):
+        prog = dwarf_program(
+            wrap_test_type_dies(
+                *labeled_int_die,
+                DwarfLabel("abstract_instance_root"),
+                DwarfDie(
+                    DW_TAG.subprogram,
+                    (
+                        DwarfAttrib(DW_AT.name, DW_FORM.string, "abs"),
+                        DwarfAttrib(DW_AT.type, DW_FORM.ref4, "int_die"),
+                        DwarfAttrib(DW_AT.inline, DW_FORM.data1, DW_INL.inlined),
+                    ),
+                    (
+                        DwarfLabel("abstract_instance_parameter"),
+                        DwarfDie(
+                            DW_TAG.formal_parameter,
+                            (
+                                DwarfAttrib(DW_AT.name, DW_FORM.string, "x"),
+                                DwarfAttrib(DW_AT.type, DW_FORM.ref4, "int_die"),
+                            ),
+                        ),
+                    ),
+                ),
+                DwarfDie(
+                    DW_TAG.subprogram,
+                    (
+                        DwarfAttrib(
+                            DW_AT.abstract_origin,
+                            DW_FORM.ref4,
+                            "abstract_instance_root",
+                        ),
+                        DwarfAttrib(DW_AT.low_pc, DW_FORM.addr, 0x7FC3EB9B1C30),
+                    ),
+                    (
+                        DwarfDie(
+                            DW_TAG.formal_parameter,
+                            (
+                                DwarfAttrib(
+                                    DW_AT.abstract_origin,
+                                    DW_FORM.ref4,
+                                    "abstract_instance_parameter",
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            )
+        )
+        self.assertIdentical(
+            prog["abs"],
+            Object(
+                prog,
+                prog.function_type(
+                    prog.int_type("int", 4, True),
+                    (TypeParameter(prog.int_type("int", 4, True), "x"),),
+                    False,
+                ),
+                address=0x7FC3EB9B1C30,
+            ),
         )
 
     def test_variable(self):
@@ -6805,7 +6913,7 @@ class TestSplitDwarf(TestCase):
                         )
                     )
                 )
-            prog.load_debug_info([f.name])
+            add_extra_dwarf(prog, f.name)
             self.assertIdentical(prog.type("TEST").type, prog.int_type("int", 4, True))
 
     def test_dwo4_not_found(self):
@@ -6833,7 +6941,12 @@ class TestSplitDwarf(TestCase):
                     )
                 )
             with self.assertLogs(logging.getLogger("drgn"), "WARNING") as log:
-                prog.load_debug_info([f.name])
+                add_extra_dwarf(prog, f.name)
+                # Force debug info to be indexed.
+                try:
+                    prog["foo"]
+                except KeyError:
+                    pass
             self.assertTrue(
                 any(
                     "split DWARF file split.dwo not found" in output
@@ -6885,7 +6998,12 @@ class TestSplitDwarf(TestCase):
                     )
                 )
             with self.assertLogs(logging.getLogger("drgn"), "WARNING") as log:
-                prog.load_debug_info([f.name])
+                add_extra_dwarf(prog, f.name)
+                # Force debug info to be indexed.
+                try:
+                    prog["foo"]
+                except KeyError:
+                    pass
             self.assertTrue(
                 any(
                     "split DWARF file split.dwo not found" in output
@@ -6930,7 +7048,7 @@ class TestSplitDwarf(TestCase):
                         version=5,
                     )
                 )
-            prog.load_debug_info([f.name])
+            add_extra_dwarf(prog, f.name)
             self.assertIdentical(prog.type("TEST").type, prog.int_type("int", 4, True))
 
     def test_dwo5_not_found(self):
@@ -6955,7 +7073,12 @@ class TestSplitDwarf(TestCase):
                     )
                 )
             with self.assertLogs(logging.getLogger("drgn"), "WARNING") as log:
-                prog.load_debug_info([f.name])
+                add_extra_dwarf(prog, f.name)
+                # Force debug info to be indexed.
+                try:
+                    prog["foo"]
+                except KeyError:
+                    pass
             self.assertTrue(
                 any(
                     "split DWARF file split.dwo not found" in output
@@ -7001,7 +7124,12 @@ class TestSplitDwarf(TestCase):
                     )
                 )
             with self.assertLogs(logging.getLogger("drgn"), "WARNING") as log:
-                prog.load_debug_info([f.name])
+                add_extra_dwarf(prog, f.name)
+                # Force debug info to be indexed.
+                try:
+                    prog["foo"]
+                except KeyError:
+                    pass
             self.assertTrue(
                 any(
                     "split DWARF file split.dwo not found" in output

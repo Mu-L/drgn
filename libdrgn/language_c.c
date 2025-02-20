@@ -12,6 +12,7 @@
 
 #include "array.h"
 #include "bitops.h"
+#include "c_lexer.h"
 #include "error.h"
 #include "language.h" // IWYU pragma: associated
 #include "lexer.h"
@@ -108,11 +109,11 @@ c_declare_basic(struct drgn_qualified_type qualified_type,
 
 static struct drgn_error *
 c_append_tagged_name(struct drgn_qualified_type qualified_type, size_t indent,
-		     struct string_builder *sb)
+		     bool need_keyword, struct string_builder *sb)
 {
 	struct drgn_error *err;
-	const char *keyword, *tag;
 
+	const char *keyword;
 	switch (drgn_type_kind(qualified_type.type)) {
 	case DRGN_TYPE_STRUCT:
 		keyword = "struct";
@@ -130,6 +131,13 @@ c_append_tagged_name(struct drgn_qualified_type qualified_type, size_t indent,
 		UNREACHABLE();
 	}
 
+	const char *tag = drgn_type_tag(qualified_type.type);
+	if (!need_keyword
+	    && (!tag
+		|| drgn_type_language(qualified_type.type)
+		   != &drgn_language_cpp))
+		need_keyword = true;
+
 	if (!append_tabs(indent, sb))
 		return &drgn_enomem;
 	if (qualified_type.qualifiers) {
@@ -139,12 +147,11 @@ c_append_tagged_name(struct drgn_qualified_type qualified_type, size_t indent,
 		if (!string_builder_appendc(sb, ' '))
 			return &drgn_enomem;
 	}
-	if (!string_builder_append(sb, keyword))
+	if (need_keyword && !string_builder_append(sb, keyword))
 		return &drgn_enomem;
 
-	tag = drgn_type_tag(qualified_type.type);
 	if (tag) {
-		if (!string_builder_appendc(sb, ' ') ||
+		if ((need_keyword && !string_builder_appendc(sb, ' ')) ||
 		    !string_builder_append(sb, tag))
 			return &drgn_enomem;
 	}
@@ -163,7 +170,7 @@ c_declare_tagged(struct drgn_qualified_type qualified_type,
 	if (anonymous && define_anonymous_type)
 		err = c_define_type(qualified_type, indent, sb);
 	else
-		err = c_append_tagged_name(qualified_type, indent, sb);
+		err = c_append_tagged_name(qualified_type, indent, false, sb);
 	if (err)
 		return err;
 	if (anonymous && !define_anonymous_type &&
@@ -341,7 +348,7 @@ c_declare_variable(struct drgn_qualified_type qualified_type,
 		   struct string_callback *name, size_t indent,
 		   bool define_anonymous_type, struct string_builder *sb)
 {
-	SWITCH_ENUM(drgn_type_kind(qualified_type.type),
+	SWITCH_ENUM(drgn_type_kind(qualified_type.type)) {
 	case DRGN_TYPE_VOID:
 	case DRGN_TYPE_INT:
 	case DRGN_TYPE_BOOL:
@@ -360,7 +367,9 @@ c_declare_variable(struct drgn_qualified_type qualified_type,
 		return c_declare_array(qualified_type, name, indent, sb);
 	case DRGN_TYPE_FUNCTION:
 		return c_declare_function(qualified_type, name, indent, sb);
-	)
+	default:
+		UNREACHABLE();
+	}
 }
 
 static struct drgn_error *
@@ -379,7 +388,7 @@ c_define_compound(struct drgn_qualified_type qualified_type, size_t indent,
 	members = drgn_type_members(qualified_type.type);
 	num_members = drgn_type_num_members(qualified_type.type);
 
-	err = c_append_tagged_name(qualified_type, indent, sb);
+	err = c_append_tagged_name(qualified_type, indent, true, sb);
 	if (err)
 		return err;
 	if (!string_builder_append(sb, " {\n"))
@@ -433,7 +442,7 @@ c_define_enum(struct drgn_qualified_type qualified_type, size_t indent,
 	enumerators = drgn_type_enumerators(qualified_type.type);
 	num_enumerators = drgn_type_num_enumerators(qualified_type.type);
 
-	err = c_append_tagged_name(qualified_type, indent, sb);
+	err = c_append_tagged_name(qualified_type, indent, true, sb);
 	if (err)
 		return err;
 	if (!string_builder_append(sb, " {\n"))
@@ -492,7 +501,7 @@ static struct drgn_error *
 c_define_type(struct drgn_qualified_type qualified_type, size_t indent,
 	      struct string_builder *sb)
 {
-	SWITCH_ENUM(drgn_type_kind(qualified_type.type),
+	SWITCH_ENUM(drgn_type_kind(qualified_type.type)) {
 	case DRGN_TYPE_VOID:
 	case DRGN_TYPE_INT:
 	case DRGN_TYPE_BOOL:
@@ -513,7 +522,9 @@ c_define_type(struct drgn_qualified_type qualified_type, size_t indent,
 	case DRGN_TYPE_FUNCTION:
 		return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
 					 "function type cannot be formatted");
-	)
+	default:
+		UNREACHABLE();
+	}
 }
 
 static struct drgn_error *
@@ -1261,9 +1272,8 @@ c_format_pointer_object(const struct drgn_object *obj,
 	bool c_string =
 		((flags & DRGN_FORMAT_OBJECT_STRING) &&
 		 is_character_type(drgn_type_type(underlying_type).type));
-	bool have_symbol;
 	uint64_t uvalue;
-	struct drgn_symbol sym;
+	_cleanup_symbol_ struct drgn_symbol *sym = NULL;
 	size_t start, type_start, type_end, value_start, value_end;
 
 	start = sb->len;
@@ -1287,18 +1297,17 @@ c_format_pointer_object(const struct drgn_object *obj,
 	if (err)
 		return err;
 
-	have_symbol = ((flags & DRGN_FORMAT_OBJECT_SYMBOLIZE) &&
-		       drgn_program_find_symbol_by_address_internal(drgn_object_program(obj),
-								    uvalue,
-								    NULL,
-								    &sym));
-	if (have_symbol && dereference && !c_string &&
+	if ((flags & DRGN_FORMAT_OBJECT_SYMBOLIZE) &&
+	    (err = drgn_program_find_symbol_by_address_internal(drgn_object_program(obj),
+								uvalue, &sym)))
+		return err;
+	if (sym && dereference && !c_string &&
 	    !string_builder_appendc(sb, '('))
 		return &drgn_enomem;
 	value_start = sb->len;
-	if (have_symbol &&
-	     !string_builder_appendf(sb, "%s+0x%" PRIx64 " = ", sym.name,
-				     uvalue - sym.address))
+	if (sym &&
+	     !string_builder_appendf(sb, "%s+0x%" PRIx64 " = ", sym->name,
+				     uvalue - sym->address))
 		return &drgn_enomem;
 
 	if (!string_builder_appendf(sb, "0x%" PRIx64, uvalue))
@@ -1307,7 +1316,7 @@ c_format_pointer_object(const struct drgn_object *obj,
 		return NULL;
 	value_end = sb->len;
 
-	if ((have_symbol && dereference && !c_string &&
+	if ((sym && dereference && !c_string &&
 	     !string_builder_appendc(sb, ')')) ||
 	    !string_builder_append(sb, " = "))
 		return &drgn_enomem;
@@ -1443,7 +1452,7 @@ c_format_array_object(const struct drgn_object *obj,
 
 	if ((flags & DRGN_FORMAT_OBJECT_STRING) && iter.length &&
 	    is_character_type(iter.element_type.type)) {
-		SWITCH_ENUM(obj->kind,
+		SWITCH_ENUM(obj->kind) {
 		case DRGN_OBJECT_VALUE: {
 			const unsigned char *buf;
 			uint64_t size, i;
@@ -1468,7 +1477,9 @@ c_format_array_object(const struct drgn_object *obj,
 			return c_format_string(drgn_object_program(obj),
 					       obj->address, iter.length, sb);
 		case DRGN_OBJECT_ABSENT:
-		)
+		default:
+			UNREACHABLE();
+		}
 	}
 
 	err = drgn_type_bit_size(iter.element_type.type,
@@ -1531,11 +1542,6 @@ c_format_object_impl(const struct drgn_object *obj, size_t indent,
 	struct drgn_error *err;
 	struct drgn_type *underlying_type = drgn_underlying_type(obj->type);
 
-	if (drgn_type_kind(underlying_type) == DRGN_TYPE_VOID) {
-		return drgn_error_create(DRGN_ERROR_TYPE,
-					 "cannot format void object");
-	}
-
 	/*
 	 * Pointers are special because they can have an asterisk prefix if
 	 * we're dereferencing them.
@@ -1570,7 +1576,10 @@ c_format_object_impl(const struct drgn_object *obj, size_t indent,
 		return NULL;
 	}
 
-	SWITCH_ENUM(drgn_type_kind(underlying_type),
+	SWITCH_ENUM(drgn_type_kind(underlying_type)) {
+	case DRGN_TYPE_VOID:
+		return drgn_error_create(DRGN_ERROR_TYPE,
+					 "cannot format void object");
 	case DRGN_TYPE_INT:
 	case DRGN_TYPE_BOOL:
 		return c_format_int_object(obj, flags, sb);
@@ -1590,10 +1599,11 @@ c_format_object_impl(const struct drgn_object *obj, size_t indent,
 					     multi_line_columns, flags, sb);
 	case DRGN_TYPE_FUNCTION:
 		return c_format_function_object(obj, sb);
-	case DRGN_TYPE_VOID:
 	case DRGN_TYPE_TYPEDEF:
 	case DRGN_TYPE_POINTER:
-	)
+	default:
+		UNREACHABLE();
+	}
 }
 
 static struct drgn_error *c_format_object(const struct drgn_object *obj,
@@ -1613,52 +1623,7 @@ static struct drgn_error *c_format_object(const struct drgn_object *obj,
 	return NULL;
 }
 
-/* This obviously incomplete since we only handle the tokens we care about. */
-enum {
-	C_TOKEN_EOF = -1,
-	MIN_KEYWORD_TOKEN,
-	MIN_SPECIFIER_TOKEN = MIN_KEYWORD_TOKEN,
-	C_TOKEN_VOID = MIN_SPECIFIER_TOKEN,
-	C_TOKEN_CHAR,
-	C_TOKEN_SHORT,
-	C_TOKEN_INT,
-	C_TOKEN_LONG,
-	C_TOKEN_SIGNED,
-	C_TOKEN_UNSIGNED,
-	C_TOKEN_BOOL,
-	C_TOKEN_FLOAT,
-	C_TOKEN_DOUBLE,
-	C_TOKEN_COMPLEX,
-	MAX_SPECIFIER_TOKEN = C_TOKEN_COMPLEX,
-	MIN_QUALIFIER_TOKEN,
-	C_TOKEN_CONST = MIN_QUALIFIER_TOKEN,
-	C_TOKEN_RESTRICT,
-	C_TOKEN_VOLATILE,
-	C_TOKEN_ATOMIC,
-	MAX_QUALIFIER_TOKEN = C_TOKEN_ATOMIC,
-	C_TOKEN_STRUCT,
-	C_TOKEN_UNION,
-	C_TOKEN_CLASS,
-	C_TOKEN_ENUM,
-	MAX_KEYWORD_TOKEN = C_TOKEN_ENUM,
-	C_TOKEN_LPAREN,
-	C_TOKEN_RPAREN,
-	C_TOKEN_LBRACKET,
-	C_TOKEN_RBRACKET,
-	C_TOKEN_ASTERISK,
-	C_TOKEN_DOT,
-	C_TOKEN_NUMBER,
-	C_TOKEN_IDENTIFIER,
-	C_TOKEN_TEMPLATE_ARGUMENTS,
-	C_TOKEN_COLON,
-};
-
 #include "c_keywords.inc"
-
-struct drgn_c_family_lexer {
-	struct drgn_lexer lexer;
-	bool cpp;
-};
 
 struct drgn_error *drgn_c_family_lexer_func(struct drgn_lexer *lexer,
 					    struct drgn_token *token) {
@@ -3185,6 +3150,165 @@ ret2:
 	return NULL;
 }
 
+static struct drgn_error *
+c_types_compatible_impl(struct drgn_qualified_type qualified_type1,
+			struct drgn_qualified_type qualified_type2,
+			bool *ret)
+{
+	struct drgn_error *err;
+
+	// The types must have the same qualifiers.
+	if (qualified_type1.qualifiers != qualified_type2.qualifiers) {
+		*ret = false;
+		return NULL;
+	}
+
+	struct drgn_type *type1 = drgn_underlying_type(qualified_type1.type);
+	struct drgn_type *type2 = drgn_underlying_type(qualified_type2.type);
+
+	// If the type descriptors are the same, then the types are definitely
+	// compatible.
+	if (type1 == type2)
+		return NULL;
+
+	if (drgn_type_kind(type1) != drgn_type_kind(type2)) {
+		// Enum types are compatible with their compatible integer type.
+		// but not with different enum types with the same compatible
+		// integer type.
+		if (drgn_type_kind(type1) == DRGN_TYPE_ENUM) {
+			qualified_type1.type = drgn_type_type(type1).type;
+			if (qualified_type1.type) {
+				return c_types_compatible_impl(qualified_type1,
+							       qualified_type2,
+							       ret);
+			}
+		} else if (drgn_type_kind(type2) == DRGN_TYPE_ENUM) {
+			qualified_type2.type = drgn_type_type(type2).type;
+			if (qualified_type2.type) {
+				return c_types_compatible_impl(qualified_type1,
+							       qualified_type2,
+							       ret);
+			}
+		}
+		*ret = false;
+		return NULL;
+	}
+
+	SWITCH_ENUM(drgn_type_kind(type1)) {
+	case DRGN_TYPE_VOID:
+	case DRGN_TYPE_INT:
+	case DRGN_TYPE_BOOL:
+	case DRGN_TYPE_FLOAT:
+		// These types are deduplicated, so if they were compatible they
+		// would have had the same type descriptor.
+		*ret = false;
+		return NULL;
+	case DRGN_TYPE_STRUCT:
+	case DRGN_TYPE_UNION:
+	case DRGN_TYPE_CLASS: {
+		// It's expensive to check all of the members, so we do a sloppy
+		// check: if the tag and size are the same, then the types are
+		// _probably_ compatible.
+		if (drgn_type_is_complete(type1) && drgn_type_is_complete(type2)
+		    && drgn_type_size(type1) != drgn_type_size(type2)) {
+			*ret = false;
+			return NULL;
+		}
+		const char *tag1 = drgn_type_tag(type1);
+		const char *tag2 = drgn_type_tag(type2);
+		if ((!tag1 != !tag2) || (tag1 && strcmp(tag1, tag2) != 0))
+			*ret = false;
+		return NULL;
+	}
+	case DRGN_TYPE_ENUM: {
+		// We do a similar sloppy check here: if the tag and compatible
+		// type are the same, then the types are _probably_ compatible.
+		if (drgn_type_is_complete(type1) && drgn_type_is_complete(type2)
+		    && drgn_underlying_type(drgn_type_type(type1).type)
+		       != drgn_underlying_type(drgn_type_type(type2).type)) {
+			*ret = false;
+			return NULL;
+		}
+		const char *tag1 = drgn_type_tag(type1);
+		const char *tag2 = drgn_type_tag(type2);
+		if ((!tag1 != !tag2) || (tag1 && strcmp(tag1, tag2) != 0))
+			*ret = false;
+		return NULL;
+	}
+	case DRGN_TYPE_POINTER:
+		// The types are compatible iff their referenced types are
+		// compatible.
+		return c_types_compatible_impl(drgn_type_type(type1),
+					       drgn_type_type(type2), ret);
+	case DRGN_TYPE_ARRAY:
+		// The types are compatible iff their element types are
+		// compatible and, if both types are complete, their lengths are
+		// equal.
+		if (drgn_type_is_complete(type1) && drgn_type_is_complete(type2)
+		    && drgn_type_length(type1) != drgn_type_length(type2)) {
+			*ret = false;
+			return NULL;
+		}
+		return c_types_compatible_impl(drgn_type_type(type1),
+					       drgn_type_type(type2), ret);
+	case DRGN_TYPE_FUNCTION: {
+		// The types are compatible iff their return types are
+		// compatible, they have the same number of parameters, their
+		// corresponding parameter types are compatible, and neither is
+		// variadic or both are variadic.
+		//
+		// This is expensive, but there's no good shortcut like for
+		// structs and enums.
+		size_t num_parameters = drgn_type_num_parameters(type1);
+		if (num_parameters != drgn_type_num_parameters(type2)
+		    || drgn_type_is_variadic(type1)
+		       != drgn_type_is_variadic(type2)) {
+			*ret = false;
+			return NULL;
+		}
+		err = c_types_compatible_impl(drgn_type_type(type1),
+					      drgn_type_type(type2),
+					      ret);
+		if (err || !*ret)
+			return err;
+		struct drgn_type_parameter *parameters1 =
+			drgn_type_parameters(type1);
+		struct drgn_type_parameter *parameters2 =
+			drgn_type_parameters(type2);
+		for (size_t i = 0; i < num_parameters; i++) {
+			struct drgn_qualified_type parameter_type1;
+			err = drgn_parameter_type(&parameters1[i],
+						  &parameter_type1);
+			if (err)
+				return err;
+			struct drgn_qualified_type parameter_type2;
+			err = drgn_parameter_type(&parameters2[i],
+						  &parameter_type2);
+			if (err)
+				return err;
+			err = c_types_compatible_impl(parameter_type1,
+						      parameter_type2, ret);
+			if (err || !*ret)
+				return err;
+		}
+		return NULL;
+	}
+	// This is already the underlying type, so it can't be a typedef.
+	case DRGN_TYPE_TYPEDEF:
+	default:
+		UNREACHABLE();
+	}
+}
+
+static struct drgn_error *
+c_types_compatible(struct drgn_qualified_type qualified_type1,
+		   struct drgn_qualified_type qualified_type2,
+		   bool *ret)
+{
+	*ret = true;
+	return c_types_compatible_impl(qualified_type1, qualified_type2, ret);
+}
+
 static struct drgn_error *c_operand_type(const struct drgn_object *obj,
 					 struct drgn_operand_type *type_ret,
 					 bool *is_pointer_ret,
@@ -3212,10 +3336,8 @@ static struct drgn_error *c_operand_type(const struct drgn_object *obj,
 		break;
 	}
 	case DRGN_TYPE_FUNCTION: {
-		struct drgn_qualified_type function_type = {
-			.type = type_ret->underlying_type,
-			.qualifiers = type_ret->qualifiers,
-		};
+		struct drgn_qualified_type function_type =
+			drgn_operand_type_qualified(type_ret);
 		uint8_t address_size;
 		err = drgn_program_address_size(drgn_object_program(obj),
 						&address_size);
@@ -3265,11 +3387,149 @@ static struct drgn_error *c_op_cast(struct drgn_object *res,
 				    const struct drgn_object *obj)
 {
 	struct drgn_error *err;
-	struct drgn_operand_type type;
-	err = c_operand_type(obj, &type, NULL, NULL);
+
+	struct drgn_object_type type;
+	err = drgn_object_type(qualified_type, 0, &type);
 	if (err)
 		return err;
-	return drgn_op_cast(res, qualified_type, obj, &type);
+
+	switch (drgn_type_kind(type.underlying_type)) {
+	case DRGN_TYPE_VOID:
+		drgn_object_set_absent_internal(res, &type);
+		return NULL;
+	case DRGN_TYPE_BOOL: {
+		bool truthy;
+		err = drgn_object_bool(obj, &truthy);
+		if (err)
+			return err;
+		return drgn_object_set_unsigned_internal(res, &type, truthy);
+	}
+	default:
+		break;
+	}
+
+	struct drgn_operand_type obj_type;
+	err = c_operand_type(obj, &obj_type, NULL, NULL);
+	if (err)
+		return err;
+	return drgn_op_cast(res, &type, obj, &obj_type);
+}
+
+static struct drgn_error *
+c_op_implicit_convert(struct drgn_object *res,
+		      struct drgn_qualified_type qualified_type,
+		      const struct drgn_object *obj)
+{
+	struct drgn_error *err;
+
+	struct drgn_object_type type;
+	err = drgn_object_type(qualified_type, 0, &type);
+	if (err)
+		return err;
+
+	if (drgn_type_kind(type.underlying_type) == DRGN_TYPE_BOOL) {
+		bool truthy;
+		err = drgn_object_bool(obj, &truthy);
+		if (err)
+			return err;
+		return drgn_object_set_unsigned_internal(res, &type, truthy);
+	}
+
+	struct drgn_operand_type obj_type;
+	err = c_operand_type(obj, &obj_type, NULL, NULL);
+	if (err)
+		return err;
+
+	SWITCH_ENUM(drgn_type_kind(type.underlying_type)) {
+	case DRGN_TYPE_INT:
+	case DRGN_TYPE_FLOAT:
+	case DRGN_TYPE_ENUM:
+		switch (drgn_type_kind(obj_type.underlying_type)) {
+		case DRGN_TYPE_INT:
+		case DRGN_TYPE_BOOL:
+		case DRGN_TYPE_FLOAT:
+		case DRGN_TYPE_ENUM:
+			break;
+		default:
+			goto incompatible_type_error;
+		}
+		break;
+	case DRGN_TYPE_STRUCT:
+	case DRGN_TYPE_UNION:
+	case DRGN_TYPE_CLASS: {
+		struct drgn_qualified_type unqualified_type1 = {
+			.type = type.underlying_type,
+		};
+		struct drgn_qualified_type unqualified_type2 = {
+			.type = obj_type.underlying_type,
+		};
+		bool compatible;
+		err = c_types_compatible(unqualified_type1, unqualified_type2,
+					 &compatible);
+		if (err)
+			return err;
+		if (!compatible)
+			goto incompatible_type_error;
+		return drgn_object_slice_internal(res, obj, &type, 0, 0);
+	}
+	case DRGN_TYPE_POINTER: {
+		if (drgn_type_kind(obj_type.underlying_type)
+		    != DRGN_TYPE_POINTER)
+			goto incompatible_type_error;
+
+		struct drgn_qualified_type referenced_type =
+			drgn_type_type(type.underlying_type);
+		referenced_type.type =
+			drgn_underlying_type(referenced_type.type);
+		struct drgn_qualified_type obj_referenced_type =
+			drgn_type_type(obj_type.underlying_type);
+		obj_referenced_type.type =
+			drgn_underlying_type(obj_referenced_type.type);
+
+		// The type pointed to by the left must have all of the
+		// qualifiers of the type pointed to by the right:
+		// (lhs.qualifiers & rhs.qualifiers) == rhs.qualifiers.
+		// We mask here and do the equality test below or in
+		// c_types_compatible().
+		referenced_type.qualifiers &= obj_referenced_type.qualifiers;
+
+		// The type pointed to by the left and the type pointed to by
+		// the right must be compatible, or at least one must be void.
+		if (drgn_type_kind(referenced_type.type) == DRGN_TYPE_VOID
+		    || drgn_type_kind(obj_referenced_type.type) == DRGN_TYPE_VOID) {
+			if (referenced_type.qualifiers
+			    != obj_referenced_type.qualifiers)
+				goto incompatible_type_error;
+		} else {
+			bool compatible;
+			err = c_types_compatible(referenced_type, obj_referenced_type,
+						 &compatible);
+			if (err)
+				return err;
+			if (!compatible)
+				goto incompatible_type_error;
+		}
+		break;
+	}
+	case DRGN_TYPE_VOID:
+	case DRGN_TYPE_ARRAY:
+	case DRGN_TYPE_FUNCTION:
+		return drgn_qualified_type_error("cannot convert to '%s'",
+						 qualified_type);
+	// We handled bool earlier.
+	case DRGN_TYPE_BOOL:
+	// This is already the underlying type, so it can't be a typedef.
+	case DRGN_TYPE_TYPEDEF:
+	default:
+		UNREACHABLE();
+	}
+
+	return drgn_op_cast(res, &type, obj, &obj_type);
+
+incompatible_type_error:
+	return drgn_2_qualified_types_error("cannot convert '%s' to incompatible type '%s'",
+					    drgn_object_qualified_type(obj),
+					    qualified_type);
 }
 
 /*
@@ -3294,9 +3554,23 @@ static struct drgn_error *c_op_bool(const struct drgn_object *obj, bool *ret)
 	struct drgn_type *underlying_type;
 
 	underlying_type = drgn_underlying_type(obj->type);
-	if (drgn_type_kind(underlying_type) == DRGN_TYPE_ARRAY) {
-		*ret = true;
-		return NULL;
+	switch (drgn_type_kind(underlying_type)) {
+	case DRGN_TYPE_ARRAY:
+	case DRGN_TYPE_FUNCTION:
+		SWITCH_ENUM(obj->kind) {
+		case DRGN_OBJECT_VALUE:
+			*ret = true;
+			return NULL;
+		case DRGN_OBJECT_REFERENCE:
+			*ret = obj->address != 0;
+			return NULL;
+		case DRGN_OBJECT_ABSENT:
+			return &drgn_error_object_absent;
+		default:
+			UNREACHABLE();
+		}
+	default:
+		break;
 	}
 
 	if (!drgn_type_is_scalar(underlying_type)) {
@@ -3540,6 +3814,7 @@ LIBDRGN_PUBLIC const struct drgn_language drgn_language_c = {
 	.bool_literal = c_bool_literal,
 	.float_literal = c_float_literal,
 	.op_cast = c_op_cast,
+	.op_implicit_convert = c_op_implicit_convert,
 	.op_bool = c_op_bool,
 	.op_cmp = c_op_cmp,
 	.op_add = c_op_add,
@@ -3570,6 +3845,7 @@ LIBDRGN_PUBLIC const struct drgn_language drgn_language_cpp = {
 	.bool_literal = c_bool_literal,
 	.float_literal = c_float_literal,
 	.op_cast = c_op_cast,
+	.op_implicit_convert = c_op_implicit_convert,
 	.op_bool = c_op_bool,
 	.op_cmp = c_op_cmp,
 	.op_add = c_op_add,

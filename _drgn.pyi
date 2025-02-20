@@ -7,6 +7,7 @@ libdrgn bindings
 Don't use this module directly. Instead, use the drgn package.
 """
 
+import collections.abc
 import enum
 import os
 import sys
@@ -19,22 +20,30 @@ from typing import (
     Iterator,
     List,
     Mapping,
+    MutableMapping,
+    NamedTuple,
     Optional,
     Sequence,
+    Set,
     Tuple,
     Union,
     overload,
 )
 
 if sys.version_info < (3, 8):
-    from typing_extensions import Final, Protocol
+    from typing_extensions import Final, Literal, Protocol
 else:
-    from typing import Final, Protocol
+    from typing import Final, Literal, Protocol
 
 if sys.version_info < (3, 10):
     from typing_extensions import TypeAlias
 else:
     from typing import TypeAlias
+
+if sys.version_info < (3, 12):
+    from typing_extensions import Buffer
+else:
+    from collections.abc import Buffer
 
 # This is effectively typing.SupportsIndex without @typing.runtime_checkable
 # (both of which are only available since Python 3.8), with a more
@@ -67,7 +76,12 @@ class Program:
     :meth:`[] <.__getitem__>` operator.
     """
 
-    def __init__(self, platform: Optional[Platform] = None) -> None:
+    def __init__(
+        self,
+        platform: Optional[Platform] = None,
+        *,
+        vmcoreinfo: Union[bytes, str, None] = None,
+    ) -> None:
         """
         Create a ``Program`` with no target program. It is usually more
         convenient to use one of the :ref:`api-program-constructors`.
@@ -75,6 +89,9 @@ class Program:
         :param platform: The platform of the program, or ``None`` if it should
             be determined automatically when a core dump or symbol file is
             added.
+        :param vmcoreinfo: Optionally provide the ``VMCOREINFO`` note data for
+            Linux kernel core dumps, which will override any detected data. When
+            not provided or ``None``, automatically detect the info.
         """
         ...
     flags: ProgramFlags
@@ -119,6 +136,7 @@ class Program:
         :param name: Object name.
         """
         ...
+
     def __contains__(self, name: str) -> bool:
         """
         Implement ``name in self``. Return whether an object (variable,
@@ -127,6 +145,7 @@ class Program:
         :param name: Object name.
         """
         ...
+
     def variable(self, name: str, filename: Optional[str] = None) -> Object:
         """
         Get the variable with the given name.
@@ -144,6 +163,7 @@ class Program:
             the given file
         """
         ...
+
     def constant(self, name: str, filename: Optional[str] = None) -> Object:
         """
         Get the constant (e.g., enumeration constant) with the given name.
@@ -165,6 +185,7 @@ class Program:
             the given file
         """
         ...
+
     def function(self, name: str, filename: Optional[str] = None) -> Object:
         """
         Get the function with the given name.
@@ -182,6 +203,7 @@ class Program:
             the given file
         """
         ...
+
     def object(
         self,
         name: str,
@@ -203,7 +225,8 @@ class Program:
             the given file
         """
         ...
-    def symbol(self, address_or_name: Union[IntegerLike, str]) -> Symbol:
+
+    def symbol(self, __address_or_name: Union[IntegerLike, str]) -> Symbol:
         """
         Get a symbol containing the given address, or a symbol with the given
         name.
@@ -218,15 +241,15 @@ class Program:
         returned arbitrarily. To retrieve all matching symbols, use
         :meth:`symbols()`.
 
-        :param address_or_name: Address or name to search for. This parameter
-            is positional-only.
+        :param address_or_name: Address or name to search for.
         :raises LookupError: if no symbol contains the given address or matches
             the given name
         """
         ...
+
     def symbols(
         self,
-        address_or_name: Union[None, IntegerLike, str] = None,
+        __address_or_name: Union[None, IntegerLike, str] = None,
     ) -> List[Symbol]:
         """
         Get a list of global and local symbols, optionally matching a name or
@@ -238,10 +261,10 @@ class Program:
         in the program are returned. In all cases, the symbols are returned in
         an unspecified order.
 
-        :param address_or_name: Address or name to search for. This parameter
-            is positional-only.
+        :param address_or_name: Address or name to search for.
         """
         ...
+
     def stack_trace(
         self,
         # Object is already IntegerLike, but this explicitly documents that it
@@ -271,6 +294,7 @@ class Program:
             ``struct task_struct *`` object.
         """
         ...
+
     def stack_trace_from_pcs(self, pcs: Sequence[IntegerLike]) -> StackTrace:
         """
         Get a stack trace with the supplied list of program counters.
@@ -278,6 +302,7 @@ class Program:
         :param pcs: List of program counters.
         """
         ...
+
     @overload
     def type(self, name: str, filename: Optional[str] = None) -> Type:
         """
@@ -293,9 +318,9 @@ class Program:
             the given file
         """
         ...
+
     @overload
-    # type is positional-only.
-    def type(self, type: Type) -> Type:
+    def type(self, __type: Type) -> Type:
         """
         Return the given type.
 
@@ -315,9 +340,11 @@ class Program:
         :return: The exact same type.
         """
         ...
+
     def threads(self) -> Iterator[Thread]:
         """Get an iterator over all of the threads in the program."""
         ...
+
     def thread(self, tid: IntegerLike) -> Thread:
         """
         Get the thread with the given thread ID.
@@ -326,6 +353,7 @@ class Program:
         :raises LookupError: if no thread has the given thread ID
         """
         ...
+
     def main_thread(self) -> Thread:
         """
         Get the main thread of the program.
@@ -335,6 +363,7 @@ class Program:
         :raises ValueError: if the program is the Linux kernel
         """
         ...
+
     def crashed_thread(self) -> Thread:
         """
         Get the thread that caused the program to crash.
@@ -348,6 +377,7 @@ class Program:
         :raises ValueError: if the program is live (i.e., not a core dump)
         """
         ...
+
     def read(
         self, address: IntegerLike, size: IntegerLike, physical: bool = False
     ) -> bytes:
@@ -370,18 +400,23 @@ class Program:
         :raises ValueError: if *size* is negative
         """
         ...
+
     def read_u8(self, address: IntegerLike, physical: bool = False) -> int:
         """ """
         ...
+
     def read_u16(self, address: IntegerLike, physical: bool = False) -> int:
         """ """
         ...
+
     def read_u32(self, address: IntegerLike, physical: bool = False) -> int:
         """ """
         ...
+
     def read_u64(self, address: IntegerLike, physical: bool = False) -> int:
         """ """
         ...
+
     def read_word(self, address: IntegerLike, physical: bool = False) -> int:
         """
         Read an unsigned integer from the program's memory in the program's
@@ -402,6 +437,7 @@ class Program:
         :raises FaultError: if the address is invalid; see :meth:`read()`
         """
         ...
+
     def add_memory_segment(
         self,
         address: IntegerLike,
@@ -427,39 +463,202 @@ class Program:
             another :ref:`buffer <python:binaryseq>` type.
         """
         ...
-    def add_type_finder(
-        self, fn: Callable[[TypeKind, str, Optional[str]], Optional[Type]]
+
+    def register_type_finder(
+        self,
+        name: str,
+        fn: Callable[[Program, TypeKindSet, str, Optional[str]], Optional[Type]],
+        *,
+        enable_index: Optional[int] = None,
     ) -> None:
         """
         Register a callback for finding types in the program.
 
-        Callbacks are called in reverse order of the order they were added
-        until the type is found. So, more recently added callbacks take
-        precedence.
+        This does not enable the finder unless *enable_index* is given.
 
-        :param fn: Callable taking a :class:`TypeKind`, name, and filename:
-            ``(kind, name, filename)``. The filename should be matched with
-            :func:`filename_matches()`. This should return a :class:`Type`
-            or ``None`` if not found.
+        :param name: Finder name.
+        :param fn: Callable taking the program, a :class:`TypeKindSet`, name,
+            and filename: ``(prog, kinds, name, filename)``. The filename
+            should be matched with :func:`filename_matches()`. This should
+            return a :class:`Type` or ``None`` if not found.
+        :param enable_index: Insert the finder into the list of enabled type
+            finders at the given index. If -1 or greater than the number of
+            enabled finders, insert it at the end. If ``None`` or not given,
+            don't enable the finder.
+        :raises ValueError: if there is already a finder with the given name
         """
         ...
+
+    def registered_type_finders(self) -> Set[str]:
+        """Return the names of all registered type finders."""
+        ...
+
+    def set_enabled_type_finders(self, names: Sequence[str]) -> None:
+        """
+        Set the list of enabled type finders.
+
+        Finders are called in the same order as the list until a type is found.
+
+        Finders that are not in the list are not called.
+
+        :param names: Names of finders to enable, in order.
+        :raises ValueError: if no finder has a given name or the same name is
+            given more than once
+        """
+        ...
+
+    def enabled_type_finders(self) -> List[str]:
+        """Return the names of enabled type finders, in order."""
+        ...
+
+    def register_object_finder(
+        self,
+        name: str,
+        fn: Callable[[Program, str, FindObjectFlags, Optional[str]], Optional[Object]],
+        *,
+        enable_index: Optional[int] = None,
+    ) -> None:
+        """
+        Register a callback for finding objects in the program.
+
+        This does not enable the finder unless *enable_index* is given.
+
+        :param name: Finder name.
+        :param fn: Callable taking the program, name, :class:`FindObjectFlags`,
+            and filename: ``(prog, name, flags, filename)``. The filename
+            should be matched with :func:`filename_matches()`. This should
+            return an :class:`Object` or ``None`` if not found.
+        :param enable_index: Insert the finder into the list of enabled object
+            finders at the given index. If -1 or greater than the number of
+            enabled finders, insert it at the end. If ``None`` or not given,
+            don't enable the finder.
+        :raises ValueError: if there is already a finder with the given name
+        """
+        ...
+
+    def registered_object_finders(self) -> Set[str]:
+        """Return the names of all registered object finders."""
+        ...
+
+    def set_enabled_object_finders(self, names: Sequence[str]) -> None:
+        """
+        Set the list of enabled object finders.
+
+        Finders are called in the same order as the list until an object is found.
+
+        Finders that are not in the list are not called.
+
+        :param names: Names of finders to enable, in order.
+        :raises ValueError: if no finder has a given name or the same name is
+            given more than once
+        """
+        ...
+
+    def enabled_object_finders(self) -> List[str]:
+        """Return the names of enabled object finders, in order."""
+        ...
+
+    def register_symbol_finder(
+        self,
+        name: str,
+        fn: Callable[[Program, Optional[str], Optional[int], bool], Sequence[Symbol]],
+        *,
+        enable_index: Optional[int] = None,
+    ) -> None:
+        """
+        Register a callback for finding symbols in the program.
+
+        This does not enable the finder unless *enable_index* is given.
+
+        The callback should take four arguments: the program, a *name*, an
+        *address*, and a boolean flag *one*. It should return a list of symbols
+        or an empty list if no matches are found.
+
+        If *name* is not ``None``, then only symbols with that name should be
+        returned. If *address* is not ``None``, then only symbols containing
+        that address should be returned. If neither is ``None``, then the
+        returned symbols must match both. If both are ``None``, then all
+        symbols should be considered matching.
+
+        When the *one* flag is ``False``, the callback should return a list of
+        all matching symbols. When it is ``True``, it should return a list with
+        at most one symbol which is the best match.
+
+        :param name: Finder name.
+        :param fn: Callable taking ``(prog, name, address, one)`` and returning
+            a sequence of :class:`Symbol`\\ s.
+        :param enable_index: Insert the finder into the list of enabled finders
+            at the given index. If -1 or greater than the number of enabled
+            finders, insert it at the end. If ``None`` or not given, don't
+            enable the finder.
+        :raises ValueError: if there is already a finder with the given name
+        """
+        ...
+
+    def registered_symbol_finders(self) -> Set[str]:
+        """Return the names of all registered symbol finders."""
+        ...
+
+    def set_enabled_symbol_finders(self, names: Sequence[str]) -> None:
+        """
+        Set the list of enabled symbol finders.
+
+        Finders are called in the same order as the list. When the *one* flag
+        is set, the search will short-circuit after the first finder which
+        returns a result, and subsequent finders will not be called. Otherwise,
+        all callbacks will be called, and all results will be returned.
+
+        Finders that are not in the list are not called.
+
+        :param names: Names of finders to enable, in order.
+        :raises ValueError: if no finder has a given name or the same name is
+            given more than once
+        """
+        ...
+
+    def enabled_symbol_finders(self) -> List[str]:
+        """Return the names of enabled symbol finders, in order."""
+        ...
+
+    def add_type_finder(
+        self, fn: Callable[[TypeKind, str, Optional[str]], Optional[Type]]
+    ) -> None:
+        """
+        Deprecated method to register and enable a callback for finding types
+        in the program.
+
+        .. deprecated:: 0.0.27
+            Use :meth:`register_type_finder()` instead.
+
+        The differences from :meth:`register_type_finder()` are:
+
+        1. *fn* is not passed *prog*.
+        2. *fn* is passed a :class:`TypeKind` instead of a
+           :class:`TypeKindSet`. If multiple kinds are being searched for, *fn*
+           will be called multiple times.
+        3. A name for the finder is generated from *fn*.
+        4. The finder is always enabled before any existing finders.
+        """
+        ...
+
     def add_object_finder(
         self,
         fn: Callable[[Program, str, FindObjectFlags, Optional[str]], Optional[Object]],
     ) -> None:
         """
-        Register a callback for finding objects in the program.
+        Deprecated method to register and enable a callback for finding objects
+        in the program.
 
-        Callbacks are called in reverse order of the order they were added
-        until the object is found. So, more recently added callbacks take
-        precedence.
+        .. deprecated:: 0.0.27
+            Use :meth:`register_object_finder()` instead.
 
-        :param fn: Callable taking a program, name, :class:`FindObjectFlags`,
-            and filename: ``(prog, name, flags, filename)``. The filename
-            should be matched with :func:`filename_matches()`. This should
-            return an :class:`Object` or ``None`` if not found.
+        The differences from :meth:`register_object_finder()` are:
+
+        1. A name for the finder is generated from *fn*.
+        2. The finder is always enabled before any existing finders.
         """
         ...
+
     def set_core_dump(self, path: Union[Path, int]) -> None:
         """
         Set the program to a core dump.
@@ -471,6 +670,7 @@ class Program:
         :param path: Core dump file path or open file descriptor.
         """
         ...
+
     def set_kernel(self) -> None:
         """
         Set the program to the running operating system kernel.
@@ -480,6 +680,7 @@ class Program:
         :meth:`load_default_debug_info()`.
         """
         ...
+
     def set_pid(self, pid: int) -> None:
         """
         Set the program to a running process.
@@ -491,47 +692,360 @@ class Program:
         :param pid: Process ID.
         """
         ...
+
+    def modules(self) -> Iterator[Module]:
+        """Get an iterator over all of the created modules in the program."""
+
+    def loaded_modules(self) -> Iterator[Tuple[Module, bool]]:
+        """
+        Determine what executables, libraries, etc. are loaded in the program
+        and create modules to represent them.
+
+        This may automatically load some debugging information necessary to
+        enumerate the modules. Other than that, it does not load debugging
+        information.
+
+        See :meth:`load_debug_info()` for a higher-level interface that does
+        load debugging information.
+
+        :return: Iterator of module and ``True`` if it was newly created
+            or ``False`` if it was previously found.
+        """
+        ...
+
+    @overload
+    def main_module(
+        self, name: Optional[Path] = None, *, create: Literal[False] = False
+    ) -> MainModule:
+        """
+        Find the main module.
+
+        :param name: :attr:`Module.name`, or ``None`` to match any name
+        :raises LookupError: if main module has not been created or its name
+            doesn't match
+        """
+        ...
+
+    @overload
+    def main_module(
+        self, name: Path, *, create: Literal[True]
+    ) -> Tuple[MainModule, bool]:
+        """
+        Find or create the main module.
+
+        :param name: :attr:`Module.name`
+        :return: Module and ``True`` if it was newly created or ``False`` if it
+            was found.
+        :raises LookupError: if main module was already created with a
+            different name
+        """
+        ...
+
+    @overload
+    def shared_library_module(
+        self,
+        name: Path,
+        dynamic_address: IntegerLike,
+        *,
+        create: Literal[False] = False,
+    ) -> SharedLibraryModule:
+        """
+        Find a shared library module.
+
+        :param name: :attr:`Module.name`
+        :param dynamic_address: :attr:`SharedLibraryModule.dynamic_address`
+        :return: Shared library module with the given name and dynamic address.
+        :raises LookupError: if no matching module has been created
+        """
+        ...
+
+    @overload
+    def shared_library_module(
+        self, name: Path, dynamic_address: IntegerLike, *, create: Literal[True]
+    ) -> Tuple[SharedLibraryModule, bool]:
+        """
+        Find or create a shared library module.
+
+        :param name: :attr:`Module.name`
+        :param dynamic_address: :attr:`SharedLibraryModule.dynamic_address`
+        :return: Module and ``True`` if it was newly created or ``False`` if it
+            was found.
+        """
+        ...
+
+    @overload
+    def vdso_module(
+        self,
+        name: Path,
+        dynamic_address: IntegerLike,
+        *,
+        create: Literal[False] = False,
+    ) -> VdsoModule:
+        """
+        Find a vDSO module.
+
+        :param name: :attr:`Module.name`
+        :param dynamic_address: :attr:`VdsoModule.dynamic_address`
+        :return: vDSO module with the given name and dynamic address.
+        :raises LookupError: if no matching module has been created
+        """
+        ...
+
+    @overload
+    def vdso_module(
+        self, name: Path, dynamic_address: IntegerLike, *, create: Literal[True]
+    ) -> Tuple[VdsoModule, bool]:
+        """
+        Find or create a vDSO module.
+
+        :param name: :attr:`Module.name`
+        :param dynamic_address: :attr:`VdsoModule.dynamic_address`
+        :return: Module and ``True`` if it was newly created or ``False`` if it
+            was found.
+        """
+        ...
+
+    @overload
+    def relocatable_module(
+        self, name: Path, address: IntegerLike, *, create: Literal[False] = False
+    ) -> RelocatableModule:
+        """
+        Find a relocatable module.
+
+        :param name: :attr:`Module.name`
+        :param address: :attr:`RelocatableModule.address`
+        :return: Relocatable module with the given name and address.
+        :raises LookupError: if no matching module has been created
+        """
+        ...
+
+    @overload
+    def relocatable_module(
+        self, name: Path, address: IntegerLike, *, create: Literal[True]
+    ) -> Tuple[RelocatableModule, bool]:
+        """
+        Find or create a relocatable module.
+
+        :param name: :attr:`Module.name`
+        :param address: :attr:`RelocatableModule.address`
+        :return: Module and ``True`` if it was newly created or ``False`` if it
+            was found.
+        """
+        ...
+
+    @overload
+    def linux_kernel_loadable_module(
+        self, module_obj: Object, *, create: Literal[False] = False
+    ) -> RelocatableModule:
+        """
+        Find a Linux kernel loadable module from a ``struct module`` object.
+
+        Note that kernel modules are represented as relocatable modules.
+
+        :param module_obj: ``struct module`` or ``struct module *`` object for
+            the kernel module.
+        :return: Relocatable module with a name and address matching
+            *module_obj*.
+        :raises LookupError: if no matching module has been created
+        """
+        ...
+
+    @overload
+    def linux_kernel_loadable_module(
+        self, module_obj: Object, *, create: Literal[True]
+    ) -> Tuple[RelocatableModule, bool]:
+        """
+        Find or create a Linux kernel loadable module from a ``struct module``
+        object.
+
+        If a new module is created, its :attr:`~Module.address_range` and
+        :attr:`~RelocatableModule.section_addresses` are set from *module_obj*.
+
+        :param module_obj: ``struct module`` or ``struct module *`` object for
+            the kernel module.
+        :return: Module and ``True`` if it was newly created or ``False`` if it
+            was found.
+        """
+        ...
+
+    @overload
+    def extra_module(
+        self, name: Path, id: IntegerLike = 0, *, create: Literal[False] = False
+    ) -> ExtraModule:
+        """
+        Find an extra module.
+
+        :param name: :attr:`Module.name`
+        :param id: :attr:`ExtraModule.id`
+        :return: Extra module with the given name and ID number.
+        :raises LookupError: if no matching module has been created
+        """
+        ...
+
+    @overload
+    def extra_module(
+        self, name: Path, id: IntegerLike = 0, *, create: Literal[True]
+    ) -> Tuple[ExtraModule, bool]:
+        """
+        Find or create an extra module.
+
+        :param name: :attr:`Module.name`
+        :param id: :attr:`ExtraModule.id`
+        :return: Module and ``True`` if it was newly created or ``False`` if it
+            was found.
+        """
+        ...
+
+    def module(self, __address: IntegerLike) -> Module:
+        """
+        Find the module containing the given address.
+
+        Addresses are matched based on :attr:`Module.address_range`.
+
+        :param address: Address to search for.
+        :raises LookupError: if no module contains the given address
+        """
+        ...
+
+    def register_debug_info_finder(
+        self,
+        name: str,
+        fn: Callable[[Sequence[Module]], None],
+        *,
+        enable_index: Optional[int] = None,
+    ) -> None:
+        """
+        Register a callback for finding debugging information.
+
+        This does not enable the finder unless *enable_index* is given.
+
+        :param name: Finder name.
+        :param fn: Callable taking a list of :class:`Module`\\ s that want
+            debugging information.
+
+            This should check :meth:`Module.wants_loaded_file()` and
+            :meth:`Module.wants_debug_file()` and do one of the following for
+            each module:
+
+            * Obtain and/or locate a file wanted by the module and call
+              :meth:`Module.try_file()`.
+            * Install files for a later finder to use.
+            * Set :attr:`Module.loaded_file_status` or
+              :attr:`Module.debug_file_status` to
+              :attr:`ModuleFileStatus.DONT_NEED` if the finder believes that
+              the file is not needed.
+            * Ignore it, for example if the finder doesn't know how to find the
+              wanted files for the module.
+        :param enable_index: Insert the finder into the list of enabled object
+            finders at the given index. If -1 or greater than the number of
+            enabled finders, insert it at the end. If ``None`` or not given,
+            don't enable the finder.
+        :raises ValueError: if there is already a finder with the given name
+        """
+        ...
+
+    def registered_debug_info_finders(self) -> Set[str]:
+        """Return the names of all registered debugging information finders."""
+        ...
+
+    def set_enabled_debug_info_finders(self, names: Sequence[str]) -> None:
+        """
+        Set the list of enabled debugging information finders.
+
+        Finders are called in the same order as the list until all wanted files
+        have been found.
+
+        Finders that are not in the list are not called.
+
+        :param names: Names of finders to enable, in order.
+        :raises ValueError: if no finder has a given name or the same name is
+            given more than once
+        """
+        ...
+
+    def enabled_debug_info_finders(self) -> List[str]:
+        """
+        Return the names of enabled debugging information finders, in order.
+        """
+        ...
+    debug_info_options: DebugInfoOptions
+    """Default options for debugging information searches."""
+
     def load_debug_info(
         self,
-        paths: Optional[Iterable[Path]] = None,
+        paths: Optional[Iterable[Path]] = (),
         default: bool = False,
         main: bool = False,
     ) -> None:
         """
-        Load debugging information for a list of executable or library files.
+        Load debugging information for the given set of files and/or modules.
 
-        Note that this is parallelized, so it is usually faster to load
-        multiple files at once rather than one by one.
+        This determines what executables, libraries, etc. are loaded in the
+        program (see :meth:`loaded_modules()`) and tries to load their
+        debugging information from the given *paths*.
 
-        :param paths: Paths of binary files.
-        :param default: Also load debugging information which can automatically
-            be determined from the program.
+        .. note::
+            It is much more efficient to load multiple files at once rather
+            than one by one when possible.
 
-            For the Linux kernel, this tries to load ``vmlinux`` and any loaded
-            kernel modules from a few standard locations.
+        :param paths: Paths of binary files to try.
 
-            For userspace programs, this tries to load the executable and any
-            loaded libraries.
+            Files that don't correspond to any loaded modules are ignored. See
+            :class:`ExtraModule` for a way to provide arbitrary debugging
+            information.
+        :param default: Try to load all debugging information for all loaded
+            modules.
+
+            The files in *paths* are tried first before falling back to the
+            enabled debugging information finders.
 
             This implies ``main=True``.
-        :param main: Also load debugging information for the main executable.
+        :param main: Try to load all debugging information for the main module.
 
-            For the Linux kernel, this tries to load ``vmlinux``.
-
-            This is currently ignored for userspace programs.
+            The files in *paths* are tried first before falling back to the
+            enabled debugging information finders.
         :raises MissingDebugInfoError: if debugging information was not
             available for some files; other files with debugging information
             are still loaded
         """
         ...
+
     def load_default_debug_info(self) -> None:
         """
-        Load debugging information which can automatically be determined from
-        the program.
+        Load all debugging information that can automatically be determined
+        from the program.
 
-        This is equivalent to ``load_debug_info(None, True)``.
+        This is equivalent to ``load_debug_info(default=True)``.
         """
         ...
+
+    def load_module_debug_info(self, *modules: Module) -> None:
+        """
+        Load debugging information for the given modules using the enabled
+        debugging information finders.
+
+        The files to search for are controlled by
+        :attr:`Module.loaded_file_status` and :attr:`Module.debug_file_status`.
+        """
+        ...
+
+    def find_standard_debug_info(
+        self, modules: Iterable[Module], options: Optional[DebugInfoOptions] = None
+    ) -> None:
+        """
+        Load debugging information for the given modules from the standard
+        locations.
+
+        This is equivalent to the ``standard`` debugging information finder
+        that is registered by default. It is intended for use by other
+        debugging information finders that need a variation of the standard
+        finder (e.g., after installing something or setting specific options).
+
+        :param modules: Modules to load debugging information for.
+        :param options: Options to use when searching for debugging
+            information. If ``None`` or not given, this uses
+            :attr:`self.debug_info_options <debug_info_options>`.
+        """
     cache: Dict[Any, Any]
     """
     Dictionary for caching program metadata.
@@ -567,6 +1081,7 @@ class Program:
         :param lang: :attr:`Type.language`
         """
         ...
+
     def int_type(
         self,
         name: str,
@@ -589,6 +1104,7 @@ class Program:
         :param lang: :attr:`Type.language`
         """
         ...
+
     def bool_type(
         self,
         name: str,
@@ -609,6 +1125,7 @@ class Program:
         :param lang: :attr:`Type.language`
         """
         ...
+
     def float_type(
         self,
         name: str,
@@ -629,6 +1146,7 @@ class Program:
         :param lang: :attr:`Type.language`
         """
         ...
+
     @overload
     def struct_type(
         self,
@@ -651,6 +1169,7 @@ class Program:
         :param lang: :attr:`Type.language`
         """
         ...
+
     @overload
     def struct_type(
         self,
@@ -664,6 +1183,7 @@ class Program:
     ) -> Type:
         """Create a new incomplete structure type."""
         ...
+
     @overload
     def union_type(
         self,
@@ -680,6 +1200,7 @@ class Program:
         this is the same as as :meth:`struct_type()`.
         """
         ...
+
     @overload
     def union_type(
         self,
@@ -693,6 +1214,7 @@ class Program:
     ) -> Type:
         """Create a new incomplete union type."""
         ...
+
     @overload
     def class_type(
         self,
@@ -709,6 +1231,7 @@ class Program:
         this is the same as as :meth:`struct_type()`.
         """
         ...
+
     @overload
     def class_type(
         self,
@@ -722,6 +1245,7 @@ class Program:
     ) -> Type:
         """Create a new incomplete class type."""
         ...
+
     @overload
     def enum_type(
         self,
@@ -742,6 +1266,7 @@ class Program:
         :param lang: :attr:`Type.language`
         """
         ...
+
     @overload
     def enum_type(
         self,
@@ -754,6 +1279,7 @@ class Program:
     ) -> Type:
         """Create a new incomplete enumerated type."""
         ...
+
     def typedef_type(
         self,
         name: str,
@@ -771,6 +1297,7 @@ class Program:
         :param lang: :attr:`Type.language`
         """
         ...
+
     def pointer_type(
         self,
         type: Type,
@@ -792,6 +1319,7 @@ class Program:
         :param lang: :attr:`Type.language`
         """
         ...
+
     def array_type(
         self,
         type: Type,
@@ -809,6 +1337,7 @@ class Program:
         :param lang: :attr:`Type.language`
         """
         ...
+
     def function_type(
         self,
         type: Type,
@@ -866,6 +1395,181 @@ class FindObjectFlags(enum.Flag):
     ANY = ...
     ""
 
+class DebugInfoOptions:
+    """
+    Options for debugging information searches.
+
+    All of these options can be reassigned.
+    """
+
+    def __init__(
+        self,
+        __options: Optional[DebugInfoOptions] = None,
+        *,
+        directories: Iterable[Path] = ...,
+        try_module_name: bool = ...,
+        try_build_id: bool = ...,
+        try_debug_link: bool = ...,
+        try_procfs: bool = ...,
+        try_embedded_vdso: bool = ...,
+        try_reuse: bool = ...,
+        try_supplementary: bool = ...,
+        kernel_directories: Iterable[Path] = ...,
+        try_kmod: KmodSearchMethod = ...,
+    ) -> None:
+        """
+        Create a ``DebugInfoOptions``.
+
+        :param options: If given, create a copy of the given options.
+            Otherwise, use the default options.
+
+        Any remaining arguments override the copied/default options.
+        """
+        ...
+    directories: Tuple[str, ...]
+    """
+    Directories to search for debugging information files.
+
+    Defaults to ``("", ".debug", "/usr/lib/debug")``, which should work out of
+    the box on most Linux distributions.
+
+    This controls searches by build ID (see :attr:`try_build_id`) and debug
+    link (see :attr:`try_debug_link`), and for kernel files (see
+    :attr:`kernel_directories`).
+    """
+    try_module_name: bool
+    """
+    If the name of a module resembles a filesystem path, try the file at that
+    path.
+
+    Defaults to ``True``.
+    """
+    try_build_id: bool
+    """
+    Try finding files using build IDs.
+
+    Defaults to ``True``.
+
+    A *build ID* is a unique byte string present in a module's :ref:`loaded
+    file <module-loaded-file>` and :ref:`debug file <module-debug-file>`. If
+    configured correctly, it is also present in core dumps and provides a
+    reliable way to identify the correct files for a module.
+
+    Searches by build ID check under each absolute path in :attr:`directories`
+    for a file named ``.build-id/xx/yyyy`` (for loaded files) or
+    ``.build-id/xx/yyyy.debug`` (for debug files), where ``xxyyyy`` is the
+    lowercase hexadecimal representation of the build ID.
+    """
+    try_debug_link: bool
+    """
+    Try finding files using debug links.
+
+    Defaults to ``True``.
+
+    A *debug link* is a pointer in a module's :ref:`loaded file
+    <module-loaded-file>` to its :ref:`debug file <module-debug-file>`. It
+    consists of a name and a checksum.
+
+    Searches by debug link check every path in :attr:`directories` for a file
+    with a matching name and checksum. Relative paths in :attr:`directories`
+    are relative to the directory containing the loaded file. An empty path in
+    :attr:`directories` means the directory containing the loaded file.
+    """
+    try_procfs: bool
+    """
+    For local processes, try getting files via the ``proc`` filesystem (e.g.,
+    :manpage:`proc_pid_exe(5)`, :manpage:`proc_pid_map_files(5)`).
+
+    Defaults to ``True``.
+    """
+    try_embedded_vdso: bool
+    """
+    Try reading the vDSO embedded in a process's memory/core dump.
+
+    Defaults to ``True``.
+
+    The entire (stripped) vDSO is included in core dumps, so this is a reliable
+    way to get it.
+    """
+    try_reuse: bool
+    """
+    Try reusing a module's loaded file as its debug file and vice versa.
+
+    Defaults to ``True``.
+    """
+    try_supplementary: bool
+    """
+    Try finding :ref:`supplementary files <module-supplementary-debug-file>`.
+
+    Defaults to ``True``.
+    """
+    kernel_directories: Tuple[str, ...]
+    """
+    Directories to search for the kernel image and loadable kernel modules.
+
+    Defaults to ``("",)``.
+
+    An empty path means to check standard paths (e.g.,
+    :file:`/boot/vmlinux-{release}`, :file:`/lib/modules/{release}`) absolutely
+    and under each absolute path in :attr:`directories`.
+    """
+    try_kmod: KmodSearchMethod
+    """
+    How to search for loadable kernel modules.
+
+    Defaults to :attr:`KmodSearchMethod.DEPMOD_OR_WALK`.
+    """
+
+class KmodSearchMethod(enum.Enum):
+    """
+    Methods of searching for loadable kernel module debugging information.
+
+    In addition to searching by build ID, there are currently two methods of
+    searching for debugging information specific to loadable kernel modules:
+
+    1. Using :manpage:`depmod(8)` metadata. This looks for :command:`depmod`
+       metadata (specifically, :file:`modules.dep.bin`) at the top level of
+       each directory in :attr:`DebugInfoOptions.kernel_directories` (an empty
+       path means :file:`/lib/modules/{release}`). The metadata is used to
+       quickly find the path of each module, which is then checked relative to
+       each directory specified by :attr:`DebugInfoOptions.kernel_directories`.
+
+       This method is faster but typically only applicable to installed
+       kernels.
+    2. Walking kernel directories. This traverses each directory specified by
+       :attr:`DebugInfoOptions.kernel_directories` looking for ``.ko`` files.
+       Module names are matched to filenames before the ``.ko`` extension and
+       with dashes (``-``) replaced with underscores (``_``).
+
+       This method is slower but not limited to installed kernels.
+
+    Debugging information searches can be configured to use one, both, or
+    neither method.
+    """
+
+    NONE = ...
+    """Don't search using kernel module-specific methods."""
+    DEPMOD = ...
+    """Search using :command:`depmod` metadata."""
+    WALK = ...
+    """Search by walking kernel directories."""
+    DEPMOD_OR_WALK = ...
+    """
+    Search using :command:`depmod` metadata, falling back to walking kernel
+    directories only if no :command:`depmod` metadata is found.
+
+    Since :command:`depmod` metadata is expected to be reliable if present,
+    this is the default.
+    """
+    DEPMOD_AND_WALK = ...
+    """
+    Search using :command:`depmod` metadata and by walking kernel directories.
+
+    Unlike :attr:`DEPMOD_OR_WALK`, if :command:`depmod` metadata is found but
+    doesn't result in the desired debugging information, this will still walk
+    kernel directories.
+    """
+
 def get_default_prog() -> Program:
     """
     Get the default program for the current thread.
@@ -874,8 +1578,7 @@ def get_default_prog() -> Program:
     """
     ...
 
-# prog is positional-only.
-def set_default_prog(prog: Optional[Program]) -> None:
+def set_default_prog(__prog: Optional[Program]) -> None:
     """
     Set the default program for the current thread.
 
@@ -890,11 +1593,398 @@ class NoDefaultProgramError(Exception):
 
     ...
 
+class Module:
+    """
+    A ``Module`` represents an executable, library, or other binary file used
+    by a program. It has several subclasses representing specific types of
+    modules.
+
+    Modules are uniquely identified by their type, name, and a type-specific
+    value.
+
+    Modules have several attributes that are determined automatically whenever
+    possible but may be overridden manually if needed.
+
+    Modules can be assigned files that provide debugging and runtime
+    information:
+
+    * .. _module-loaded-file:
+
+      The "loaded file" is the file containing the executable code, data, etc.
+      used by the program at runtime.
+
+
+    * .. _module-debug-file:
+
+      The "debug file" is the file containing debugging information (e.g.,
+      `DWARF <https://dwarfstd.org/>`_).
+
+      The loaded file and debug file may be the same file, for example, an
+      unstripped binary. They may be different files if the binary was stripped
+      and its debugging information was split into a separate file.
+
+
+    * .. _module-supplementary-debug-file:
+
+      The debug file may depend on a "supplementary debug file" such as one
+      generated by `dwz(1) <https://manpages.debian.org/dwz.1.html>`_. If so,
+      then the supplementary debug file must be found before the debug file can
+      be used.
+    """
+
+    prog: Final[Program]
+    """Program that this module is from."""
+    name: Final[str]
+    """
+    Name of this module.
+
+    Its exact meaning varies by module type.
+    """
+    address_range: Optional[Tuple[int, int]]
+    """
+    Address range where this module is loaded.
+
+    This is a tuple of the start (inclusive) and end (exclusive) addresses. If
+    the module is not loaded in memory, then both are 0. If not known yet, then
+    this is ``None``.
+
+    :meth:`Program.loaded_modules()` sets this automatically from the program
+    state/core dump when possible. Otherwise, for :class:`MainModule`,
+    :class:`SharedLibraryModule`, and :class:`VdsoModule`, it may be set
+    automatically when a file is assigned to the module. It is never set
+    automatically for :class:`ExtraModule`. It can also be set manually.
+    """
+    build_id: Optional[bytes]
+    """
+    Unique byte string (e.g., GNU build ID) identifying files used by this
+    module.
+
+    If not known, then this is ``None``.
+
+    :meth:`Program.loaded_modules()` sets this automatically from the program
+    state/core dump when possible. Otherwise, when a file is assigned to the
+    module, it is set to the file's build ID if it is not already set. It can
+    also be set manually.
+    """
+    loaded_file_status: ModuleFileStatus
+    """Status of the module's :ref:`loaded file <module-loaded-file>`."""
+    loaded_file_path: Optional[str]
+    """
+    Absolute path of the module's :ref:`loaded file <module-loaded-file>`, or
+    ``None`` if not known.
+    """
+    loaded_file_bias: Optional[int]
+    """
+    Difference between the load address in the program and addresses in the
+    :ref:`loaded file <module-loaded-file>` itself.
+
+    This is often non-zero due to address space layout randomization (ASLR).
+
+    It is set automatically based on the module type:
+
+    * For :class:`MainModule`, it is set based on metadata from the process or
+      core dump (the `auxiliary vector
+      <https://man7.org/linux/man-pages/man3/getauxval.3.html>`_ for userspace
+      programs, the ``VMCOREINFO`` note for the Linux kernel).
+    * For :class:`SharedLibraryModule` and :class:`VdsoModule`, it is set based
+      on :attr:`~SharedLibraryModule.dynamic_address`.
+    * For :class:`RelocatableModule`, it is set to zero. Addresses are adjusted
+      according to :attr:`~RelocatableModule.section_addresses` instead.
+    * For :class:`ExtraModule`, it is set based on
+      :attr:`~Module.address_range`.
+    """
+    debug_file_status: ModuleFileStatus
+    """Status of the module's :ref:`debug file <module-debug-file>`."""
+    debug_file_path: Optional[str]
+    """
+    Absolute path of the module's :ref:`debug file <module-debug-file>`, or
+    ``None`` if not known.
+    """
+    debug_file_bias: Optional[int]
+    """
+    Difference between the load address in the program and addresses in the
+    :ref:`debug file <module-debug-file>`.
+
+    See :attr:`loaded_file_bias`.
+    """
+    supplementary_debug_file_kind: Optional[SupplementaryFileKind]
+    """
+    Kind of the module's :ref:`supplementary debug file
+    <module-supplementary-debug-file>`, or ``None`` if not known or not needed.
+    """
+    supplementary_debug_file_path: Optional[str]
+    """
+    Absolute path of the module's :ref:`supplementary debug file
+    <module-supplementary-debug-file>`, or ``None`` if not known or not needed.
+    """
+
+    def wants_loaded_file(self) -> bool:
+        """
+        Return whether this module wants a :ref:`loaded file
+        <module-loaded-file>`.
+
+        This should be preferred over checking :attr:`loaded_file_status`
+        directly since this is future-proof against new status types being
+        added. It is currently equivalent to ``module.loaded_file_status ==
+        ModuleFileStatus.WANT``.
+        """
+        ...
+
+    def wants_debug_file(self) -> bool:
+        """
+        Return whether this module wants a :ref:`debug file
+        <module-debug-file>`.
+
+        This should be preferred over checking :attr:`debug_file_status`
+        directly since this is future-proof against new status types being
+        added. It is currently equivalent to ``module.debug_file_status ==
+        ModuleFileStatus.WANT or module.debug_file_status ==
+        ModuleFileStatus.WANT_SUPPLEMENTARY``.
+        """
+        ...
+
+    def wanted_supplementary_debug_file(self) -> WantedSupplementaryFile:
+        """
+        Return information about the :ref:`supplementary debug file
+        <module-supplementary-debug-file>` that this module currently wants.
+
+        :raises ValueError: if the module doesn't currently want a
+            supplementary debug file (i.e., ``module.debug_file_status !=
+            ModuleFileStatus.WANT_SUPPLEMENTARY``)
+        """
+        ...
+
+    def try_file(
+        self,
+        path: Path,
+        *,
+        fd: int = -1,
+        force: bool = False,
+    ) -> None:
+        """
+        Try to use the given file for this module.
+
+        If the file does not appear to belong to this module, then it is
+        ignored. This currently checks that the file and the module have the
+        same build ID.
+
+        If :attr:`loaded_file_status` is :attr:`~ModuleFileStatus.WANT` and the
+        file is loadable, then it is used as the :ref:`loaded file
+        <module-loaded-file>` and :attr:`loaded_file_status` is set to
+        :attr:`~ModuleFileStatus.HAVE`.
+
+        If :attr:`debug_file_status` is :attr:`~ModuleFileStatus.WANT` or
+        :attr:`~ModuleFileStatus.WANT_SUPPLEMENTARY` and the file provides
+        debugging information, then it is used as the :ref:`debug file
+        <module-debug-file>` and :attr:`debug_file_status` is set to
+        :attr:`~ModuleFileStatus.HAVE`. However, if the file requires a
+        supplementary debug file, then it is not used as the debug file yet and
+        :attr:`debug_file_status` is set to
+        :attr:`~ModuleFileStatus.WANT_SUPPLEMENTARY` instead.
+
+        If :attr:`debug_file_status` is
+        :attr:`~ModuleFileStatus.WANT_SUPPLEMENTARY` and the file matches
+        :meth:`wanted_supplementary_debug_file()`, then the previously found
+        file is used as the debug file, the given file is used as the
+        :ref:`supplementary debug file <module-supplementary-debug-file>`, and
+        :attr:`debug_file_status` is set to :attr:`~ModuleFileStatus.HAVE`.
+
+        The file may be used as both the loaded file and debug file if
+        applicable.
+
+        :param path: Path to file.
+        :param fd: If nonnegative, an open file descriptor referring to the
+            file. This always takes ownership of the file descriptor even if
+            the file is not used or on error, so the caller must not close it.
+        :param force: If ``True``, then don't check whether the file matches
+            the module.
+        """
+        ...
+
+class MainModule(Module):
+    """
+    Main module.
+
+    There is only one main module in a program. For userspace programs, it is
+    the executable, and its name is usually the absolute path of the
+    executable. For the Linux kernel, it is the kernel image, a.k.a.
+    ``vmlinux``, and its name is "kernel".
+    """
+
+class SharedLibraryModule(Module):
+    """
+    Shared library (a.k.a. dynamic library, dynamic shared object, or ``.so``)
+    module.
+
+    Shared libraries are uniquely identified by their name (usually the
+    absolute path of the shared object file) and dynamic address.
+    """
+
+    dynamic_address: Final[int]
+    """Address of the shared object's dynamic section."""
+
+class VdsoModule(Module):
+    """
+    Virtual dynamic shared object (vDSO) module.
+
+    The vDSO is a special shared library automatically loaded into a process by
+    the kernel; see :manpage:`vdso(7)`. It is uniquely identified by its name
+    (the ``SONAME`` field of the shared object file) and dynamic address.
+    """
+
+    dynamic_address: Final[int]
+    """Address of the shared object's dynamic section."""
+
+class RelocatableModule(Module):
+    """
+    Relocatable object module.
+
+    A relocatable object is an object file requiring a linking step to assign
+    section addresses and adjust the file to reference those addresses.
+
+    Linux kernel loadable modules (``.ko`` files) are a special kind of
+    relocatable object.
+
+    For userspace programs, relocatable objects are usually intermediate
+    products of the compilation process (``.o`` files). They are not typically
+    loaded at runtime. However, drgn allows manually defining a relocatable
+    module and assigning its section addresses if needed.
+
+    Relocatable modules are uniquely identified by a name and address.
+    """
+
+    address: Final[int]
+    """
+    Address identifying the module.
+
+    For Linux kernel loadable modules, this is the module base address.
+    """
+
+    section_addresses: MutableMapping[str, int]
+    """
+    Mapping from section names to assigned addresses.
+
+    Once a file has been assigned to the module, this can no longer be
+    modified.
+
+    :meth:`Program.linux_kernel_loadable_module()` and
+    :meth:`Program.loaded_modules()` prepopulate this for Linux kernel loadable
+    modules.
+    """
+
+class ExtraModule(Module):
+    """
+    Module with extra debugging information.
+
+    For advanced use cases, it may be necessary to manually add debugging
+    information that does not fit into any of the categories above.
+    ``ExtraModule`` is intended for these use cases. For example, it can be
+    used to add debugging information from a standalone file that is not in use
+    by a particular program.
+
+    Extra modules are uniquely identified by an arbitrary name and ID number.
+    """
+
+    id: Final[int]
+    """Arbitrary identification number."""
+
+class ModuleFileStatus(enum.Enum):
+    """
+    Status of a file in a :class:`Module`.
+
+    This is usually used to communicate with debugging information finders; see
+    :meth:`Program.register_debug_info_finder()`.
+    """
+
+    WANT = ...
+    """File has not been found and should be searched for."""
+
+    HAVE = ...
+    """File has already been found and assigned."""
+
+    DONT_WANT = ...
+    """
+    File has not been found, but it should not be searched for.
+
+    :meth:`Module.try_file()` and debugging information finders are required to
+    honor this and will never change it. However, other operations may reset
+    this to :attr:`WANT` when they load debugging information automatically.
+    """
+
+    DONT_NEED = ...
+    """
+    File has not been found and is not needed (e.g., because its debugging
+    information is not applicable or is provided through another mechanism).
+
+    In contrast to :attr:`DONT_WANT`, drgn itself will never change this to
+    :attr:`WANT`.
+    """
+
+    WANT_SUPPLEMENTARY = ...
+    """
+    File has been found, but it requires a supplementary file before it can be
+    used. See :meth:`Module.wanted_supplementary_debug_file()`.
+    """
+
+class WantedSupplementaryFile(NamedTuple):
+    """Information about a wanted supplementary file."""
+
+    kind: SupplementaryFileKind
+    """Kind of supplementary file."""
+    path: str
+    """Path of main file that wants the supplementary file."""
+    supplementary_path: str
+    """
+    Path to the supplementary file.
+
+    This may be absolute or relative to :attr:`path`.
+    """
+    checksum: bytes
+    """
+    Unique identifier of the supplementary file.
+
+    The interpretation depends on :attr:`kind`.
+    """
+
+class SupplementaryFileKind(enum.Enum):
+    """
+    Kind of supplementary file.
+
+    .. note::
+        DWARF 5 supplementary files are not currently supported but may be in
+        the future.
+
+        DWARF package files are not considered supplementary files. They are
+        considered part of the debug file and must have the same path as the
+        debug file plus a ".dwp" extension.
+    """
+
+    GNU_DEBUGALTLINK = ...
+    """
+    GNU-style supplementary debug file referred to by a ``.gnu_debugaltlink``
+    section.
+
+    Its :attr:`~WantedSupplementaryFile.checksum` is the file's GNU build ID.
+    """
+
 class Thread:
     """A thread in a program."""
 
     tid: Final[int]
     """Thread ID (as defined by :manpage:`gettid(2)`)."""
+    name: Optional[str]
+    """
+    Thread name, or ``None`` if unknown.
+
+    See `PR_SET_NAME
+    <https://man7.org/linux/man-pages/man2/PR_SET_NAME.2const.html>`_ and
+    `/proc/pid/comm
+    <https://man7.org/linux/man-pages/man5/proc_pid_comm.5.html>`_.
+
+    .. note::
+        Linux userspace core dumps only save the name of the main thread, so
+        :attr:`name` will be ``None`` for other threads.
+    """
     object: Final[Object]
     """
     If the program is the Linux kernel, the ``struct task_struct *`` object for
@@ -1159,6 +2249,7 @@ class Object:
             The default is ``None``, which means the object is not a bit field.
         """
         ...
+
     @overload
     def __init__(self, prog: Program, *, value: Union[int, float, bool]) -> None:
         """
@@ -1171,6 +2262,7 @@ class Object:
         :param value: Value of the literal.
         """
         ...
+
     @overload
     def __init__(
         self,
@@ -1189,6 +2281,7 @@ class Object:
             the object.
         """
         ...
+
     @overload
     def __init__(
         self,
@@ -1247,6 +2340,7 @@ class Object:
         :param name: Attribute name.
         """
         ...
+
     def __getitem__(self, idx: IntegerLike) -> Object:
         """
         Implement ``self[idx]``. Get the array element at the given index.
@@ -1274,6 +2368,7 @@ class Object:
         :raises TypeError: if this object is not a pointer or array
         """
         ...
+
     def __len__(self) -> int:
         """
         Implement ``len(self)``. Get the number of elements in this object.
@@ -1286,6 +2381,7 @@ class Object:
         :raises TypeError: if this object is not an array with complete type
         """
         ...
+
     def value_(self) -> Any:
         """
         Get the value of this object as a Python object.
@@ -1302,6 +2398,7 @@ class Object:
             ``void``)
         """
         ...
+
     def string_(self) -> bytes:
         """
         Read a null-terminated string pointed to by this object.
@@ -1318,6 +2415,7 @@ class Object:
         :raises TypeError: if this object is not a pointer or array
         """
         ...
+
     def member_(self, name: str) -> Object:
         """
         Get a member of this object.
@@ -1337,6 +2435,7 @@ class Object:
             given name
         """
         ...
+
     def address_of_(self) -> Object:
         """
         Get a pointer to this object.
@@ -1351,6 +2450,7 @@ class Object:
         :raises ValueError: if this object is a value
         """
         ...
+
     def read_(self) -> Object:
         """
         Read this object (which may be a reference or a value) and return it as
@@ -1368,21 +2468,26 @@ class Object:
             ``void``)
         """
         ...
+
     def to_bytes_(self) -> bytes:
         """Return the binary representation of this object's value."""
         ...
+
     @classmethod
     def from_bytes_(
         cls,
         prog: Program,
         type: Union[str, Type],
-        bytes: bytes,
+        bytes: Buffer,
         *,
         bit_offset: IntegerLike = 0,
         bit_field_size: Optional[IntegerLike] = None,
     ) -> Object:
         """
         Return a value object from its binary representation.
+
+        >>> print(Object.from_bytes_(prog, "int", b"\x10\x00\x00\x00"))
+        (int)16
 
         :param prog: Program to create the object in.
         :param type: Type of the object.
@@ -1393,6 +2498,7 @@ class Object:
             The default is ``None``, which means the object is not a bit field.
         """
         ...
+
     def format_(
         self,
         *,
@@ -1468,6 +2574,7 @@ class Object:
             value (i.e., for C, zero-initialized). Defaults to ``False``.
         """
         ...
+
     def __iter__(self) -> Iterator[Object]: ...
     def __bool__(self) -> bool: ...
     def __lt__(self, other: Any) -> bool: ...
@@ -1524,18 +2631,48 @@ def NULL(prog: Program, type: Union[str, Type]) -> Object:
 
 def cast(type: Union[str, Type], obj: Object) -> Object:
     """
-    Get the value of the given object casted to another type.
+    Get the value of an object explicitly casted to another type.
 
-    Objects with a scalar type (integer, boolean, enumerated, floating-point,
-    or pointer) can be casted to a different scalar type. Other objects can
-    only be casted to the same type. This always results in a value object. See
-    also :func:`drgn.reinterpret()`.
+    This uses the programming language's rules for explicit conversions, like
+    the cast operator.
 
     >>> cast("unsigned int", Object(prog, "float", 2.0))
     (unsigned int)2
+    >>> cast("void *", Object(prog, "int", 0))
+    (void *)0x0
+
+    See also :func:`implicit_convert()` for implicit conversions (which usually
+    do stricter type checking) and :func:`reinterpret()` for reinterpreting the
+    raw memory of an object.
 
     :param type: Type to cast to.
     :param obj: Object to cast.
+    :return: Casted object. This is always a value object.
+    :raises TypeError: if casting *obj* to *type* is not allowed
+    """
+    ...
+
+def implicit_convert(type: Union[str, Type], obj: Object) -> Object:
+    """
+    Get the value of an object implicitly converted to another type.
+
+    This uses the programming language's rules for implicit conversions, like
+    when assigning to a variable or passing arguments to a function call.
+
+    >>> implicit_convert("unsigned int", Object(prog, "float", 2.0))
+    (unsigned int)2
+    >>> implicit_convert("void *", Object(prog, "int", 0))
+    Traceback (most recent call last):
+      ...
+    TypeError: cannot convert 'int' to incompatible type 'void *'
+
+    See also :func:`cast()` for explicit conversions and :func:`reinterpret()`
+    for reinterpreting the raw memory of an object.
+
+    :param type: Type to convert to.
+    :param obj: Object to convert.
+    :return: Converted object. This is always a value object.
+    :raises TypeError: if converting *obj* to *type* is not allowed
     """
     ...
 
@@ -1544,15 +2681,24 @@ def reinterpret(type: Union[str, Type], obj: Object) -> Object:
     Get the representation of an object reinterpreted as another type.
 
     This reinterprets the raw memory of the object, so an object can be
-    reinterpreted as any other type. Reinterpreting a reference results in a
-    reference, and reinterpreting a value results in a value. See also
-    :func:`drgn.cast()`.
+    reinterpreted as any other type.
 
     >>> reinterpret("unsigned int", Object(prog, "float", 2.0))
     (unsigned int)1073741824
 
+    .. note::
+
+        You usually want :func:`cast()` or :func:`implicit_convert()` instead,
+        which convert the *value* of an object instead of its in-memory
+        representation.
+
     :param type: Type to reinterpret as.
     :param obj: Object to reinterpret.
+    :return: Reinterpreted object. If *obj* is a reference object, then this is
+        a reference object. If *obj* is a value object, then this is a value
+        object.
+    :raises OutOfBoundsError: if *obj* is a value object and *type* is larger
+        than *obj*
     """
     ...
 
@@ -1581,6 +2727,24 @@ class Symbol:
     identifier along with its corresponding address range in the program.
     """
 
+    def __init__(
+        self,
+        name: str,
+        address: int,
+        size: int,
+        binding: SymbolBinding,
+        kind: SymbolKind,
+    ) -> None:
+        """
+        Create a ``Symbol``.
+
+        :param name: :attr:`Symbol.name`
+        :param address: :attr:`Symbol.address`
+        :param size: :attr:`Symbol.size`
+        :param binding: :attr:`Symbol.binding`
+        :param kind: :attr:`Symbol.kind`
+        """
+        ...
     name: Final[str]
     """Name of this symbol."""
 
@@ -1595,6 +2759,69 @@ class Symbol:
 
     kind: Final[SymbolKind]
     """Kind of entity represented by this symbol."""
+
+class SymbolIndex:
+    """
+    A ``SymbolIndex`` contains a static set of symbols and allows efficient
+    lookup by name and address.
+
+    With :meth:`Program.register_symbol_finder()`, you can add a callback to
+    provide custom symbol finding logic. However, in many cases, all that is
+    necessary is to provide drgn with a list of symbols that you know to be part
+    of the program. This object allows you to do that. It efficiently implements
+    the Symbol Finder API given a static set of symbols. For example::
+
+        >>> prog = drgn.Program()
+        >>> symbol = drgn.Symbol("foo", 0x123, 1, drgn.SymbolBinding.GLOBAL, drgn.SymbolKind.OBJECT)
+        >>> finder = drgn.SymbolIndex([symbol])
+        >>> prog.register_symbol_finder("SymbolIndex", finder, enable_index=0)
+        >>> prog.symbols()
+        [Symbol(name='foo', address=0x123, size=0x1, binding=<SymbolBinding.GLOBAL: 2>, kind=<SymbolKind.OBJECT: 1>)]
+        >>> prog.symbol("bar")
+        Traceback (most recent call last):
+          File "<console>", line 1, in <module>
+        LookupError: not found
+        >>> prog.symbol("foo")
+        Symbol(name='foo', address=0x123, size=0x1, binding=<SymbolBinding.GLOBAL: 2>, kind=<SymbolKind.OBJECT: 1>)
+        >>> prog.symbol(0x100)
+        Traceback (most recent call last):
+          File "<console>", line 1, in <module>
+        LookupError: not found
+        >>> prog.symbol(0x123)
+        Symbol(name='foo', address=0x123, size=0x1, binding=<SymbolBinding.GLOBAL: 2>, kind=<SymbolKind.OBJECT: 1>)
+    """
+
+    def __init__(self, symbols: Iterable[Symbol]) -> None:
+        """
+        Create a ``SymbolIndex`` from a sequence of symbols
+
+        The returned symbol index satisfies the Symbol Finder API. It supports
+        overlapping symbol address ranges and duplicate symbol names. However,
+        in the case of these sorts of conflicts, it doesn't provide any
+        guarantee on the order of the results, or which result is returned when
+        a single symbol is requested.
+
+        :param symbols: An iterable of symbols
+        :returns: A callable object suitable to provide to
+          :meth:`Program.register_symbol_finder()`.
+        """
+
+    def __call__(
+        self,
+        prog: Program,
+        name: Optional[str],
+        address: Optional[int],
+        one: bool,
+    ) -> List[Symbol]:
+        """
+        Lookup symbol by name, address, or both.
+
+        :param prog: (unused) the program looking up this symbol
+        :param name: if given, only return symbols with this name
+        :param address: if given, only return symbols spanning this address
+        :param one: if given, limit the result to a single symbol
+        :returns: a list of matching symbols (empty if none are found)
+        """
 
 class SymbolBinding(enum.Enum):
     """
@@ -1714,23 +2941,28 @@ class StackFrame:
     (int)1
     """
 
-    name: Final[Optional[str]]
+    name: Final[str]
+    """
+    Name of the function or symbol at this frame.
+
+    This tries to get the best available name for this frame in the following
+    order:
+
+    1. The name of the function in the source code based on debugging
+       information (:attr:`frame.function_name <function_name>`).
+    2. The name of the symbol in the binary (:meth:`frame.symbol().name
+       <symbol>`).
+    3. The program counter in hexadecimal (:attr:`hex(frame.pc) <pc>`).
+    4. The string "???".
+    """
+
+    function_name: Final[Optional[str]]
     """
     Name of the function at this frame, or ``None`` if it could not be
     determined.
 
     The name cannot be determined if debugging information is not available for
-    the function, e.g., because it is implemented in assembly. It may be
-    desirable to use the symbol name or program counter as a fallback:
-
-    .. code-block:: python3
-
-        name = frame.name
-        if name is None:
-            try:
-                name = frame.symbol().name
-            except LookupError:
-                name = hex(frame.pc)
+    the function, e.g., because it is implemented in assembly.
     """
 
     is_inline: Final[bool]
@@ -1773,6 +3005,7 @@ class StackFrame:
         :param name: Object name.
         """
         ...
+
     def __contains__(self, name: str) -> bool:
         """
         Implement ``name in self``. Return whether an object with the given
@@ -1781,6 +3014,7 @@ class StackFrame:
         :param name: Object name.
         """
         ...
+
     def locals(self) -> List[str]:
         """
         Get a list of the names of all local objects (local variables, function
@@ -1791,6 +3025,7 @@ class StackFrame:
         :meth:`[] <.__getitem__>` operator to check.
         """
         ...
+
     def source(self) -> Tuple[str, int, int]:
         """
         Get the source code location of this frame.
@@ -1799,6 +3034,7 @@ class StackFrame:
         :raises LookupError: if the source code location is not available
         """
         ...
+
     def symbol(self) -> Symbol:
         """
         Get the function symbol at this stack frame.
@@ -1810,6 +3046,7 @@ class StackFrame:
             prog.symbol(frame.pc - (0 if frame.interrupted else 1))
         """
         ...
+
     def register(self, reg: str) -> int:
         """
         Get the value of the given register at this stack frame.
@@ -1819,12 +3056,14 @@ class StackFrame:
         :raises LookupError: if the register value is not known
         """
         ...
+
     def registers(self) -> Dict[str, int]:
         """
         Get the values of all available registers at this stack frame as a
         dictionary with the register names as keys.
         """
         ...
+
     def _repr_pretty_(self, p: Any, cycle: bool) -> None: ...
 
 class Type:
@@ -1950,6 +3189,7 @@ class Type:
     def type_name(self) -> str:
         """Get a descriptive full name of this type."""
         ...
+
     def is_complete(self) -> bool:
         """
         Get whether this type is complete (i.e., the type definition is known).
@@ -1959,6 +3199,7 @@ class Type:
         is always ``True``.
         """
         ...
+
     def qualified(self, qualifiers: Qualifiers) -> Type:
         """
         Get a copy of this type with different qualifiers.
@@ -1968,9 +3209,11 @@ class Type:
         :param qualifiers: New type qualifiers.
         """
         ...
+
     def unqualified(self) -> Type:
         """Get a copy of this type with no qualifiers."""
         ...
+
     def member(self, name: str) -> TypeMember:
         """
         Look up a member in this type by name.
@@ -1987,6 +3230,7 @@ class Type:
             name
         """
         ...
+
     def has_member(self, name: str) -> bool:
         """
         Return whether this type has a member with the given name.
@@ -1998,6 +3242,7 @@ class Type:
         :raises TypeError: if this type is not a structure, union, or class
             type
         """
+
     def _repr_pretty_(self, p: Any, cycle: bool) -> None: ...
 
 class TypeMember:
@@ -2217,9 +3462,6 @@ class TypeKind(enum.Enum):
     FLOAT = ...
     """Floating-point type."""
 
-    COMPLEX = ...
-    """Complex type."""
-
     STRUCT = ...
     """Structure type."""
 
@@ -2243,6 +3485,26 @@ class TypeKind(enum.Enum):
 
     FUNCTION = ...
     """Function type."""
+
+class TypeKindSet(collections.abc.Set[TypeKind]):
+    """
+    Immutable set of :class:`TypeKind`\\ s.
+
+    >>> kinds = TypeKindSet({TypeKind.STRUCT, TypeKind.CLASS})
+    >>> TypeKind.STRUCT in kinds
+    True
+    >>> TypeKind.INT in kinds
+    False
+    >>> for kind in kinds:
+    ...     print(kind)
+    ...
+    TypeKind.STRUCT
+    TypeKind.CLASS
+    """
+
+    def __contains__(self, __x: object) -> bool: ...
+    def __iter__(self) -> Iterator[TypeKind]: ...
+    def __len__(self) -> int: ...
 
 class PrimitiveType(enum.Enum):
     """A ``PrimitiveType`` represents a primitive type known to drgn."""
@@ -2302,14 +3564,26 @@ class Qualifiers(enum.Flag):
     ATOMIC = ...
     """Atomic type."""
 
-# type_or_obj is positional-only.
-def sizeof(type_or_obj: Union[Type, Object]) -> int:
+def sizeof(__type_or_obj: Union[Type, Object]) -> int:
     """
     Get the size of a :class:`Type` or :class:`Object` in bytes.
 
     :param type_or_obj: Entity to get the size of.
     :raises TypeError: if the type does not have a size (e.g., because it is
         incomplete or void)
+    """
+    ...
+
+def alignof(__type: Type) -> int:
+    """
+    Get the alignment requirement (in bytes) of a :class:`Type`.
+
+    This corresponds to |alignof()|_ in C.
+
+    .. |alignof()| replace:: ``_Alignof()``
+    .. _alignof(): https://en.cppreference.com/w/c/language/_Alignof
+
+    :raises TypeError: if *type* is a function type or an incomplete type
     """
     ...
 
@@ -2320,7 +3594,7 @@ def offsetof(type: Type, member: str) -> int:
     This corresponds to |offsetof()|_ in C.
 
     .. |offsetof()| replace:: ``offsetof()``
-    .. _offsetof(): https://en.cppreference.com/w/cpp/types/offsetof
+    .. _offsetof(): https://en.cppreference.com/w/c/types/offsetof
 
     :param type: Structure, union, or class type.
     :param member: Name of member. May include one or more member references
@@ -2399,6 +3673,15 @@ def _linux_helper_per_cpu_ptr(ptr: Object, cpu: IntegerLike) -> Object:
 
 def _linux_helper_cpu_curr(__prog: Program, __cpu: IntegerLike) -> Object: ...
 def _linux_helper_idle_task(__prog: Program, __cpu: IntegerLike) -> Object: ...
+def _linux_helper_task_thread_info(task: Object) -> Object:
+    """
+    Return the thread information structure for a task.
+
+    :param task: ``struct task_struct *``
+    :return: ``struct thread_info *``
+    """
+    ...
+
 def _linux_helper_task_cpu(task: Object) -> int:
     """
     Return the CPU number that the given task last ran on.
@@ -2423,3 +3706,8 @@ def _linux_helper_pid_task(pid: Object, pid_type: IntegerLike) -> Object:
 def _linux_helper_find_task(__ns: Object, __pid: IntegerLike) -> Object: ...
 def _linux_helper_kaslr_offset(__prog: Program) -> int: ...
 def _linux_helper_pgtable_l5_enabled(__prog: Program) -> bool: ...
+def _linux_helper_load_proc_kallsyms(
+    filename: Optional[str] = None,
+    modules: bool = False,
+) -> SymbolIndex: ...
+def _linux_helper_load_builtin_kallsyms(prog: Program) -> SymbolIndex: ...

@@ -2,11 +2,14 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
 #include <byteswap.h>
+#include <elf.h>
 #include <gelf.h>
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "binary_search.h"
+#include "cleanup.h"
 #include "debug_info.h" // IWYU pragma: associated
 #include "elf_file.h"
 #include "error.h"
@@ -15,10 +18,13 @@
 #include "program.h"
 #include "util.h"
 
+DEFINE_VECTOR(uint64_range_vector, struct uint64_range);
+
 void drgn_module_orc_info_deinit(struct drgn_module *module)
 {
 	free(module->orc.entries);
 	free(module->orc.pc_offsets);
+	free(module->orc.preferred);
 }
 
 // Getters for "raw" ORC information, i.e., before it is aligned, byte swapped,
@@ -52,10 +58,27 @@ drgn_raw_orc_entry_is_terminator(struct drgn_module *module, unsigned int i)
 	}
 }
 
-static _Thread_local struct drgn_module *compare_orc_entries_module;
-static int compare_orc_entries(const void *a, const void *b)
+static bool
+drgn_raw_orc_entry_is_preferred(struct drgn_module *module, unsigned int i)
 {
-	struct drgn_module *module = compare_orc_entries_module;
+	uint16_t flags;
+	memcpy(&flags, &module->orc.entries[i].flags, sizeof(flags));
+	if (drgn_elf_file_bswap(module->debug_file))
+		flags = bswap_16(flags);
+	// ORC_REG_SP_INDIRECT is used for the stack switching pattern used in
+	// the Linux kernel's call_on_stack()/call_on_irqstack() macros. See
+	// Linux kernel commits 87ccc826bf1c ("x86/unwind/orc: Change
+	// REG_SP_INDIRECT"), aafeb14e9da2 ("objtool: Support stack-swizzle"),
+	// and a0cfc74d0b00 ("x86/irq: Provide macro for inlining irq stack
+	// switching") (in v5.12). These macros switch the stack pointer in
+	// inline assembly, resulting in inaccurate DWARF CFI. So, we should use
+	// ORC to unwind these instead.
+	return (flags & 0xf) == DRGN_ORC_REG_SP_INDIRECT;
+}
+
+static int compare_orc_entries(const void *a, const void *b, void *arg)
+{
+	struct drgn_module *module = arg;
 	unsigned int index_a = *(unsigned int *)a;
 	unsigned int index_b = *(unsigned int *)b;
 
@@ -102,32 +125,60 @@ static unsigned int keep_orc_entry(struct drgn_module *module,
  * Note that we don't bother checking EH CFI because currently ORC is only used
  * for the Linux kernel on x86-64, which explicitly disables EH data.
  */
-static unsigned int remove_fdes_from_orc(struct drgn_module *module,
-					 unsigned int *indices,
-					 unsigned int num_entries)
+static struct drgn_error *
+remove_fdes_from_orc(struct drgn_module *module, unsigned int *indices,
+		     struct uint64_range_vector *preferred,
+		     unsigned int *num_entriesp)
 {
+	char *env = getenv("DRGN_PREFER_ORC_UNWINDER");
+	if (env && atoi(env)) {
+		struct uint64_range *range =
+			uint64_range_vector_append_entry(preferred);
+		if (!range)
+			return &drgn_enomem;
+		range->start = 0;
+		range->end = UINT64_MAX;
+		return NULL;
+	}
+
 	if (module->dwarf.debug_frame.num_fdes == 0)
-		return num_entries;
+		return NULL;
 
 	struct drgn_dwarf_fde *fde = module->dwarf.debug_frame.fdes;
 	struct drgn_dwarf_fde *last_fde =
 		fde + module->dwarf.debug_frame.num_fdes - 1;
 
+	unsigned int num_entries = *num_entriesp;
 	unsigned int new_num_entries = 0;
 
-	/* Keep any entries that start before the first DWARF FDE. */
-	uint64_t start_pc;
-	for (;;) {
-		start_pc = drgn_raw_orc_pc(module, new_num_entries);
-		if (fde->initial_location <= start_pc)
-			break;
-		new_num_entries++;
-		if (new_num_entries == num_entries)
-			return num_entries;
-	}
+	uint64_t start_pc = drgn_raw_orc_pc(module, 0);
+	uint64_t end_pc;
+	for (unsigned int i = 0; i < num_entries; i++, start_pc = end_pc) {
+		if (i < num_entries - 1)
+			end_pc = drgn_raw_orc_pc(module, i + 1);
+		else
+			end_pc = UINT64_MAX;
 
-	for (unsigned int i = new_num_entries; i < num_entries - 1; i++) {
-		uint64_t end_pc = drgn_raw_orc_pc(module, i + 1);
+		if (drgn_raw_orc_entry_is_preferred(module, i)) {
+			struct uint64_range *range =
+				uint64_range_vector_append_entry(preferred);
+			if (!range)
+				return &drgn_enomem;
+			range->start = start_pc;
+			range->end = end_pc;
+			new_num_entries = keep_orc_entry(module, indices,
+							 new_num_entries, i);
+			continue;
+		}
+
+		if (start_pc < fde->initial_location) {
+			// The current ORC entry starts before the current FDE
+			// (which can only happen if it is the first FDE). Keep
+			// it.
+			new_num_entries = keep_orc_entry(module, indices,
+							 new_num_entries, i);
+			continue;
+		}
 
 		/*
 		 * Find the last FDE that starts at or before the current ORC
@@ -144,26 +195,12 @@ static unsigned int remove_fdes_from_orc(struct drgn_module *module,
 			/*
 			 * The current FDE doesn't cover the current ORC entry.
 			 */
-			if (fde == last_fde) {
-				/*
-				 * There are no more FDEs. Keep the remaining
-				 * ORC entries.
-				 */
-				if (i != new_num_entries) {
-					memmove(&indices[new_num_entries],
-						&indices[i],
-						(num_entries - i) *
-						sizeof(indices[0]));
-				}
-				return new_num_entries + (num_entries - i);
-			}
-			if (fde[1].initial_location - fde->initial_location
-			    > fde->address_range) {
-				/*
-				 * There is a gap between the current FDE and
-				 * the next FDE that exposes the current ORC
-				 * entry. Keep it.
-				 */
+			if (fde == last_fde
+			    || fde[1].initial_location - fde->initial_location
+			       > fde->address_range) {
+				// Either there are no more FDEs or there is a
+				// gap between the current FDE and the next FDE
+				// that exposes the current ORC entry. Keep it.
 				new_num_entries = keep_orc_entry(module,
 								 indices,
 								 new_num_entries,
@@ -172,12 +209,9 @@ static unsigned int remove_fdes_from_orc(struct drgn_module *module,
 			}
 			fde++;
 		}
-
-		start_pc = end_pc;
 	}
-	/* We don't know where the last ORC entry ends, so always keep it. */
-	return keep_orc_entry(module, indices, new_num_entries,
-			      num_entries - 1);
+	*num_entriesp = new_num_entries;
+	return NULL;
 }
 
 static int orc_version_from_header(Elf_Data *orc_header)
@@ -268,6 +302,10 @@ static struct drgn_error *drgn_read_orc_sections(struct drgn_module *module)
 		return NULL;
 	}
 
+	err = drgn_elf_file_apply_relocations(module->debug_file);
+	if (err)
+		return err;
+
 	// Since Linux kernel b9f174c811e3 ("x86/unwind/orc: Add ELF section
 	// with ORC version identifier") (in v6.4), which was also backported to
 	// Linux 6.3.10, vmlinux and kernel modules have a .orc_header ELF
@@ -318,27 +356,38 @@ static struct drgn_error *drgn_read_orc_sections(struct drgn_module *module)
 	return NULL;
 }
 
-static struct drgn_error *drgn_debug_info_parse_orc(struct drgn_module *module)
+static inline void drgn_module_clear_orc(struct drgn_module **modulep)
+{
+	if (*modulep) {
+		(*modulep)->orc.pc_offsets = NULL;
+		(*modulep)->orc.entries = NULL;
+	}
+}
+
+struct drgn_error *drgn_module_parse_orc(struct drgn_module *module)
 {
 	struct drgn_error *err;
 
-	if (!module->debug_file->platform.arch->orc_to_cfi)
+	if (module->debug_file->platform.arch->arch != DRGN_ARCH_X86_64)
 		return NULL;
+
+	// pc_offsets and entries point to the Elf_Data buffers until we're
+	// done. We don't want those freed by drgn_module_orc_info_deinit(), so
+	// clear them if anything goes wrong.
+	_cleanup_(drgn_module_clear_orc) struct drgn_module *clear = module;
 
 	err = drgn_read_orc_sections(module);
 	if (err || !module->orc.num_entries)
-		goto out_clear;
+		return err;
 
 	unsigned int num_entries = module->orc.num_entries;
-	unsigned int *indices = malloc_array(num_entries, sizeof(indices[0]));
-	if (!indices) {
-		err = &drgn_enomem;
-		goto out_clear;
-	}
+	_cleanup_free_ unsigned int *indices =
+		malloc_array(num_entries, sizeof(indices[0]));
+	if (!indices)
+		return &drgn_enomem;
 	for (unsigned int i = 0; i < num_entries; i++)
 		indices[i] = i;
 
-	compare_orc_entries_module = module;
 	/*
 	 * Sort the ORC entries for binary search. Since Linux kernel commit
 	 * f14bf6a350df ("x86/unwind/orc: Remove boot-time ORC unwind tables
@@ -346,27 +395,27 @@ static struct drgn_error *drgn_debug_info_parse_orc(struct drgn_module *module)
 	 * it if necessary.
 	 */
 	for (unsigned int i = 1; i < num_entries; i++) {
-		if (compare_orc_entries(&indices[i - 1], &indices[i]) > 0) {
-			qsort(indices, num_entries, sizeof(indices[0]),
-			      compare_orc_entries);
+		if (compare_orc_entries(&indices[i - 1], &indices[i], module) > 0) {
+			qsort_arg(indices, num_entries, sizeof(indices[0]),
+				  compare_orc_entries, module);
 			break;
 		}
 	}
 
-	num_entries = remove_fdes_from_orc(module, indices, num_entries);
+	VECTOR(uint64_range_vector, preferred);
 
-	int32_t *pc_offsets = malloc_array(num_entries, sizeof(pc_offsets[0]));
-	if (!pc_offsets) {
-		err = &drgn_enomem;
-		goto out;
-	}
-	struct drgn_orc_entry *entries = malloc_array(num_entries,
-						      sizeof(entries[0]));
-	if (!entries) {
-		free(pc_offsets);
-		err = &drgn_enomem;
-		goto out;
-	}
+	err = remove_fdes_from_orc(module, indices, &preferred, &num_entries);
+	if (err)
+		return err;
+
+	_cleanup_free_ int32_t *pc_offsets =
+		malloc_array(num_entries, sizeof(pc_offsets[0]));
+	if (!pc_offsets)
+		return &drgn_enomem;
+	_cleanup_free_ struct drgn_orc_entry *entries =
+		malloc_array(num_entries, sizeof(entries[0]));
+	if (!entries)
+		return &drgn_enomem;
 	const int32_t *orig_offsets = module->orc.pc_offsets;
 	const struct drgn_orc_entry *orig_entries = module->orc.entries;
 	const bool bswap = drgn_elf_file_bswap(module->debug_file);
@@ -420,19 +469,25 @@ static struct drgn_error *drgn_debug_info_parse_orc(struct drgn_module *module)
 		pc_offsets[i] = UINT64_C(4) * index + offset - UINT64_C(4) * i;
 	}
 
-	module->orc.pc_offsets = pc_offsets;
-	module->orc.entries = entries;
+	uint64_range_vector_shrink_to_fit(&preferred);
+	uint64_range_vector_steal(&preferred, &module->orc.preferred,
+				  &module->orc.num_preferred);
+	module->orc.pc_offsets = no_cleanup_ptr(pc_offsets);
+	module->orc.entries = no_cleanup_ptr(entries);
 	module->orc.num_entries = num_entries;
+	clear = NULL;
+	return NULL;
+}
 
-	err = NULL;
-out:
-	free(indices);
-	if (err) {
-out_clear:
-		module->orc.pc_offsets = NULL;
-		module->orc.entries = NULL;
-	}
-	return err;
+bool drgn_module_should_prefer_orc_cfi(struct drgn_module *module, uint64_t pc)
+{
+	uint64_t unbiased_pc = pc - module->debug_file_bias;
+	#define less_than_uint64_range_start(a, b) (*(a) < (b)->start)
+	size_t i = binary_search_gt(module->orc.preferred,
+				    module->orc.num_preferred, &unbiased_pc,
+				    less_than_uint64_range_start);
+	#undef less_than_uint64_range_start
+	return i > 0 && module->orc.preferred[i - 1].end > unbiased_pc;
 }
 
 static inline uint64_t drgn_orc_pc(struct drgn_module *module, unsigned int i)
@@ -445,35 +500,19 @@ drgn_module_find_orc_cfi(struct drgn_module *module, uint64_t pc,
 			 struct drgn_cfi_row **row_ret, bool *interrupted_ret,
 			 drgn_register_number *ret_addr_regno_ret)
 {
-	struct drgn_error *err;
-
-	if (!module->parsed_orc) {
-		err = drgn_debug_info_parse_orc(module);
-		if (err)
-			return err;
-		module->parsed_orc = true;
-	}
-
 	uint64_t unbiased_pc = pc - module->debug_file_bias;
-	/*
-	 * We don't know the maximum program counter covered by the ORC data,
-	 * but the last entry seems to always be a terminator, so it doesn't
-	 * matter. All addresses beyond the max will fall into the last entry.
-	 */
-	if (!module->orc.num_entries || unbiased_pc < drgn_orc_pc(module, 0))
+	#define less_than_orc_pc(a, b)	\
+		(*(a) < drgn_orc_pc(module, (b) - module->orc.pc_offsets))
+	size_t i = binary_search_gt(module->orc.pc_offsets,
+				    module->orc.num_entries, &unbiased_pc,
+				    less_than_orc_pc);
+	#undef less_than_orc_pc
+	// We can tell when the program counter is below the minimum program
+	// counter included in the ORC data, but we don't know the maximum. The
+	// last entry seems to always be a terminator, so it doesn't matter. All
+	// addresses beyond the max will fall into the last entry.
+	if (i == 0)
 		return &drgn_not_found;
-	unsigned int lo = 0, hi = module->orc.num_entries, found = 0;
-	while (lo < hi) {
-		unsigned int mid = lo + (hi - lo) / 2;
-		if (drgn_orc_pc(module, mid) <= unbiased_pc) {
-			found = mid;
-			lo = mid + 1;
-		} else {
-			hi = mid;
-		}
-	}
-	return module->debug_file->platform.arch->orc_to_cfi(&module->orc.entries[found],
-							     row_ret,
-							     interrupted_ret,
-							     ret_addr_regno_ret);
+	return drgn_orc_to_cfi_x86_64(&module->orc.entries[i - 1], row_ret,
+				      interrupted_ret, ret_addr_regno_ret);
 }
